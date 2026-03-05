@@ -44,19 +44,85 @@ In your base working directory, you need:
 - **INCAR.start**: Used only for iteration 1. Typically includes full SCF setup from scratch
 - **INCAR.cont**: Used for iterations 2 and beyond. Should enable `ISTART=1` to read WAVECAR/CHGCAR from previous iteration
 
-Example:
+**INCAR.start** (first iteration - fresh start):
 ```
-# INCAR.start
-ISTART = 0
-NSW = 100
-...
+! First iteration - fresh start without restart files
+SYSTEM = MoS2 Bilayer Structure
 
-# INCAR.cont
-ISTART = 1
-ICHARGE = 1
-NSW = 100
-...
+! Electronic relaxation
+PREC   = Accurate
+ENCUT  = 400
+ISTART = 0           ! Fresh start (no WAVECAR)
+ICHARG = 2           ! Build charge density from scratch
+
+! Ionic relaxation
+IBRION = 2           ! CG relaxation algorithm
+NSW    = 100         ! Max 100 ionic steps
+POTIM  = 0.5         ! Timestep for ionic motion
+ISIF   = 3           ! Relax ions and cell volume
+EDIFFG = -0.01       ! Energy convergence criterion
+
+! SCF convergence
+NELM   = 100         ! Max 100 electronic steps
+NELMIN = 4
+EDIFF  = 1e-04       ! SCF convergence
+
+! Output
+LWAVE  = .TRUE.      ! Write WAVECAR
+LCHARG = .TRUE.      ! Write CHGCAR
+NWRITE = 2
+
+! Smearing for metals (adjust for your system)
+ISMEAR = 1           ! Methfessel-Paxton order 1
+SIGMA  = 0.05        ! Smearing width
+
+! Parallelization
+NPAR   = 4
+KPAR   = 1
 ```
+
+**INCAR.cont** (iterations 2+ - continue from checkpoint):
+```
+! Continuation iteration - read from previous WAVECAR
+SYSTEM = MoS2 Bilayer Structure
+
+! Electronic relaxation
+PREC   = Accurate
+ENCUT  = 400
+ISTART = 1           ! Read WAVECAR from previous iteration
+ICHARG = 1           ! Read charge density from CHGCAR
+ICHARGE = 0          ! Neutral charge
+
+! Ionic relaxation (same as start, or tighter)
+IBRION = 2           ! CG algorithm
+NSW    = 100         ! Max 100 ionic steps per iteration
+POTIM  = 0.5         ! Timestep
+ISIF   = 3           ! Relax ions and cell
+EDIFFG = -0.01       ! Convergence check
+
+! SCF convergence
+NELM   = 100
+NELMIN = 4
+EDIFF  = 1e-04
+
+! Output
+LWAVE  = .TRUE.      ! Overwrite WAVECAR for next iteration
+LCHARG = .TRUE.      ! Overwrite CHGCAR for next iteration
+NWRITE = 2
+
+! Smearing
+ISMEAR = 1
+SIGMA  = 0.05
+
+! Parallelization
+NPAR   = 4
+KPAR   = 1
+```
+
+**Key differences:**
+- `ISTART = 1` to read from WAVECAR
+- `ICHARG = 1` to read from CHGCAR
+- Remove `ICHARGE = 2` (not needed when reading charge)
 
 ### SLURM Configuration
 
