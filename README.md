@@ -3,7 +3,7 @@ Bash based automation for slurm job submission
 
 ## What Was Created
 
-You now have a complete, production-ready VASP iteration chain automation system with the following components:
+A complete, production-ready (VASP-only for now) iteration chain automation system with the following components:
 
 ### Core Scripts (Updated)
 
@@ -18,13 +18,16 @@ You now have a complete, production-ready VASP iteration chain automation system
 #### 2. **`launch.sh`** - Orchestrator & Monitor
 - Fully rewritten with comprehensive features:
   - Configurable via command-line arguments (--name, --success-string, --monitor-interval, etc.)
+  - **Resume from any iteration** with --continue-from N
   - Creates iteration-N folders with proper file management
   - Submits jobs with SBATCH coordination
   - **Monitors job status every configurable interval** (default 30 min)
   - **Detects actual compute time** via `sacct` (excludes queue time)
   - **Writes STOPCAR at 22 hours** of actual running
   - **Writes LABORT at 23 hours** as fallback
-  - Checks OUTCAR for user-defined success string
+  - **Early convergence detection**: Jobs completing without STOPCAR are considered converged
+  - **Divergence detection**: Monitors for increasing energy/forces, allows one retry
+  - Checks OUTCAR for user-defined success string (optional)
   - **Logs everything to timestamped chain_*.log files**
   - Handles WAVECAR/CHGCAR checkpoint files automatically
   - Full error handling with descriptive messages
@@ -126,6 +129,8 @@ This will verify all required files and configuration. Output looks like:
     --continue-from 1 \
     --monitor-interval 1800
 ```
+
+**Note**: `--success-string` is optional. If not provided, early completion (without STOPCAR) is considered successful convergence.
 
 ### Step 5: Monitor Progress
 
@@ -266,6 +271,14 @@ tail -50 iteration-1/OUTCAR
 Use exact text:
 ```bash
 ./launch.sh --success-string "your exact string here"
+```
+
+### Early Convergence (No Success String)
+
+For calculations that converge before the STOPCAR timing:
+```bash
+./launch.sh --name "fast-converging" --max-iter 10
+# No --success-string needed - early completion = success
 ```
 
 ### Resume from Specific Iteration

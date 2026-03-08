@@ -16,7 +16,7 @@ set -euo pipefail
 #SBATCH --partition=standard
 #SBATCH --qos=small
 #SBATCH -N 2
-#SBATCH --ntasks-per-node=40
+#SBATCH --ntasks-per-node=24
 #SBATCH --time=24:00:00
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out

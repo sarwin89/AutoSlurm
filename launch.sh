@@ -27,7 +27,7 @@ set -euo pipefail
 CONTINUE_FROM=1
 MAX_ITER=20
 JOB_PREFIX="VASP-calc"
-SUCCESS_STRING="reached structural accuracy"  # User can override
+SUCCESS_STRING=""  # Optional: if empty, early completion without STOPCAR is success
 MONITOR_INTERVAL=1800                          # 30 minutes in seconds
 STOPCAR_TIME=79200                            # 22 hours of actual run time (seconds)
 LABORT_TIME=82800                             # 23 hours of actual run time (seconds)
@@ -35,6 +35,8 @@ LABORT_TIME=82800                             # 23 hours of actual run time (sec
 BASE_DIR="$(pwd)"
 CHAIN_LOG="${BASE_DIR}/chain_$(date '+%Y%m%d_%H%M%S').log"
 SUBMIT_SCRIPT="${BASE_DIR}/submit.sh"
+
+DIVERGENCE_RETRY=0
 
 # ──────────────────────────────────────────────────────────────────────────────
 #                         ARGUMENT PARSING
@@ -66,6 +68,8 @@ while [[ $# -gt 0 ]]; do
             echo "Unknown option: $1"
             echo "Usage: $0 [--continue-from N] [--max-iter M] [--name PREFIX]"
             echo "          [--success-string TEXT] [--monitor-interval SECS]"
+            echo "Note: --success-string is optional. If not provided, early completion"
+            echo "      without STOPCAR is considered successful convergence."
             exit 1
             ;;
     esac
@@ -123,7 +127,11 @@ log_msg "VASP Chain Automation Started"
 log_msg "Base directory:    $BASE_DIR"
 log_msg "Iterations:        $CONTINUE_FROM → $MAX_ITER"
 log_msg "Job name prefix:   $JOB_PREFIX"
-log_msg "Success string:    $SUCCESS_STRING"
+if [[ -n "$SUCCESS_STRING" ]]; then
+    log_msg "Success string:    '$SUCCESS_STRING'"
+else
+    log_msg "Success criteria:  Early completion (no STOPCAR written)"
+fi
 log_msg "Monitor interval:  $MONITOR_INTERVAL seconds (${MONITOR_INTERVAL}s ≈ $((MONITOR_INTERVAL/60)) min)"
 log_msg "═════════════════════════════════════════════════════════════"
 
@@ -135,11 +143,11 @@ while [[ $iter -le $MAX_ITER ]]; do
     log_iter "$iter" "────────────────────────────────────────────────"
     log_iter "$iter" "Preparing iteration $iter of $MAX_ITER"
 
-    # ──────────────────────────────
-    #   Setup iteration folder
-    # ──────────────────────────────
     ITER_DIR="${BASE_DIR}/iteration-${iter}"
-    mkdir -p "$ITER_DIR" || { log_iter "$iter" "ERROR: Cannot create $ITER_DIR"; exit 1; }
+    if [[ $DIVERGENCE_RETRY -eq 1 ]]; then
+        ITER_DIR="${BASE_DIR}/iteration-${iter}-retry"
+        log_iter "$iter" "Using retry folder for divergence recovery"
+    fi
 
     # Select INCAR source (start for first, cont for rest)
     if [[ $iter -eq 1 ]]; then
@@ -255,15 +263,73 @@ while [[ $iter -le $MAX_ITER ]]; do
     done
 
     # ──────────────────────────────
-    #   Post-job: Check success
+    #   Post-job: Check success and convergence
     # ──────────────────────────────
     if [[ "$STATE" == "COMPLETED" ]]; then
         log_iter "$iter" "Job completed. Checking convergence..."
 
-        # Look for success string in OUTCAR
-        if [[ -f "${ITER_DIR}/OUTCAR" ]] && grep -q "$SUCCESS_STRING" "${ITER_DIR}/OUTCAR"; then
-            log_iter "$iter" "✓ SUCCESS: Found '$SUCCESS_STRING' in OUTCAR"
+        SUCCESS=0
+        DIVERGENCE_DETECTED=0
 
+        # Check for divergence in OUTCAR (increasing energy or forces)
+        if [[ -f "${ITER_DIR}/OUTCAR" ]]; then
+            # Check if energy is increasing in recent steps (simple check)
+            LAST_ENERGIES=$(grep "total energy" "${ITER_DIR}/OUTCAR" | tail -3 | awk '{print $5}')
+            if [[ $(echo "$LAST_ENERGIES" | wc -l) -eq 3 ]]; then
+                # Check if the last energy is higher than the first of the last 3
+                FIRST_ENERGY=$(echo "$LAST_ENERGIES" | head -1)
+                LAST_ENERGY=$(echo "$LAST_ENERGIES" | tail -1)
+                ENERGY_INCREASE=$(awk -v first="$FIRST_ENERGY" -v last="$LAST_ENERGY" 'BEGIN {if (last > first) print 1; else print 0}')
+                if [[ "$ENERGY_INCREASE" -eq 1 ]]; then
+                    log_iter "$iter" "⚠ WARNING: Energy divergence detected (energy increasing from $FIRST_ENERGY to $LAST_ENERGY)"
+                    DIVERGENCE_DETECTED=1
+                fi
+            fi
+
+            # Check for very high forces indicating convergence issues
+            TOTAL_FORCE=$(grep "total force" "${ITER_DIR}/OUTCAR" | tail -1 | awk '{print $4}')
+            if [[ -n "$TOTAL_FORCE" ]]; then
+                # Use awk for comparison
+                HIGH_FORCE=$(awk -v force="$TOTAL_FORCE" 'BEGIN {if (force > 1.0) print 1; else print 0}')
+                if [[ "$HIGH_FORCE" -eq 1 ]]; then
+                    log_iter "$iter" "⚠ WARNING: High total force ($TOTAL_FORCE) - possible convergence issues"
+                fi
+            fi
+        fi
+
+        # Check success criteria
+        if [[ -n "$SUCCESS_STRING" ]]; then
+            # Success string provided - check for it
+            if grep -q "$SUCCESS_STRING" "${ITER_DIR}/OUTCAR" 2>/dev/null; then
+                log_iter "$iter" "✓ SUCCESS: Found '$SUCCESS_STRING' in OUTCAR"
+                SUCCESS=1
+            else
+                log_iter "$iter" "✗ ERROR: Success string '$SUCCESS_STRING' not found in OUTCAR"
+                SUCCESS=0
+            fi
+        else
+            # No success string - check if completed without STOPCAR (early convergence)
+            if [[ $STOPCAR_WRITTEN -eq 0 ]]; then
+                log_iter "$iter" "✓ SUCCESS: Job completed without STOPCAR (early convergence)"
+                SUCCESS=1
+            else
+                log_iter "$iter" "⚠ Job completed with STOPCAR written - may not be fully converged"
+                SUCCESS=0
+            fi
+        fi
+
+        # Handle divergence: allow one retry
+        if [[ $SUCCESS -eq 0 && $DIVERGENCE_DETECTED -eq 1 && $DIVERGENCE_RETRY -eq 0 ]]; then
+            log_iter "$iter" "Divergence detected - allowing one retry iteration"
+            DIVERGENCE_RETRY=1
+            # Don't advance iteration, will retry same one
+            continue
+        elif [[ $DIVERGENCE_DETECTED -eq 1 && $DIVERGENCE_RETRY -eq 1 ]]; then
+            log_iter "$iter" "✗ ERROR: Divergence persists after retry - stopping chain"
+            exit 1
+        fi
+
+        if [[ $SUCCESS -eq 1 ]]; then
             # Copy CONTCAR to POSCAR for next iteration
             if [[ -f "${ITER_DIR}/CONTCAR" && -s "${ITER_DIR}/CONTCAR" ]]; then
                 cp -f "${ITER_DIR}/CONTCAR" "${BASE_DIR}/POSCAR"
@@ -280,15 +346,15 @@ while [[ $iter -le $MAX_ITER ]]; do
                 next=$((iter + 1))
                 log_iter "$iter" "Advancing to iteration $next"
                 iter=$next
+                DIVERGENCE_RETRY=0
 
             else
                 log_iter "$iter" "✗ ERROR: CONTCAR missing or empty in iteration folder"
                 log_iter "$iter" "Stopping chain - check job output in $ITER_DIR"
                 exit 1
             fi
-
         else
-            log_iter "$iter" "✗ ERROR: Success string '$SUCCESS_STRING' not found in OUTCAR"
+            log_iter "$iter" "✗ ERROR: Convergence criteria not met"
             log_iter "$iter" "Check ${ITER_DIR}/OUTCAR or job.*.out for details"
             log_iter "$iter" "Stopping chain"
             exit 1
