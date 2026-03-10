@@ -1,7 +1,38 @@
 # AutoSlurm
-Bash based automation for slurm job submission
 
-## What Was Created
+[![Bash](https://img.shields.io/badge/Made%20with-Bash-1f425f.svg)](https://www.gnu.org/software/bash/)
+[![SLURM](https://img.shields.io/badge/SLURM-Compatible-blue.svg)](https://slurm.schedmd.com/)
+[![VASP](https://img.shields.io/badge/VASP-Ready-green.svg)](https://www.vasp.at/)
+
+Bash-based automation for iterative SLURM job submission, designed for computational materials science workflows (VASP-focused).
+
+## Quick Start
+
+```bash
+# 1. Prepare your VASP files (INCAR.start, INCAR.cont, POSCAR, KPOINTS, POTCAR)
+# 2. Configure submit.sh for your cluster (partition, nodes, etc.)
+# 3. Run setup check
+./setup-check.sh
+
+# 4. Launch your iteration chain
+./launch.sh --name "my-calc" --max-iter 20 --success-string "reached structural accuracy"
+
+# 5. Monitor progress
+tail -f chain_*.log
+```
+
+## Table of Contents
+
+- [What Was Created](#what-was-created)
+- [Key Improvements](#key-improvements)
+- [What You Need To Do](#what-you-need-to-do)
+- [Architecture Diagram](#architecture-diagram)
+- [STOPCAR/LABORT Timing Explanation](#stopcarlabort-timing-explanation)
+- [Customization Reference](#customization-reference)
+- [Monitoring Commands](#monitoring-commands)
+- [Troubleshooting Quick Links](#troubleshooting-quick-links)
+- [Next Steps](#next-steps)
+- [Support Materials](#support-materials)
 
 A complete, production-ready (VASP-only for now) iteration chain automation system with the following components:
 
@@ -130,7 +161,7 @@ This will verify all required files and configuration. Output looks like:
     --monitor-interval 1800
 ```
 
-**Note**: `--success-string` is optional. If not provided, early completion (without STOPCAR) is considered successful convergence.
+**Note**: `--success-string` is optional. If not provided, successful job completion is considered convergence.
 
 ### Step 5: Monitor Progress
 

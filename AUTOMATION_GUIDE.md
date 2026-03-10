@@ -15,7 +15,8 @@ The automation consists of two main scripts:
 ✓ **Automatic iteration foldering** - Creates `iteration-N` folders with proper INCAR management  
 ✓ **Job monitoring & logging** - Monitors status every 30-60 min, logs to timestamped chain log  
 ✓ **Checkpoint file handling** - Automatically copies WAVECAR/CHGCAR between iterations  
-✓ **Success string validation** - Checks OUTCAR for user-defined convergence string  
+✓ **Success string validation** - Checks OUTCAR for user-defined convergence string (optional)  
+✓ **Divergence detection & retry** - Monitors for energy increase/force issues, allows one retry  
 ✓ **Resume capability** - Can restart from any iteration  
 
 ---
@@ -201,9 +202,11 @@ For each iteration N:
   7. At 22h actual runtime: write STOPCAR with LSTOP=.TRUE.
   8. At 23h actual runtime: write LABORT=.TRUE. to STOPCAR
   9. When job finishes:
-     - Check OUTCAR for SUCCESS_STRING
-     - If found: copy CONTCAR→POSCAR, WAVECAR/CHGCAR→base, advance to N+1
-     - If not found: stop with error
+     - Check OUTCAR for SUCCESS_STRING (if provided)
+     - Check for divergence (energy increasing, high forces)
+     - If success: copy CONTCAR→POSCAR, WAVECAR/CHGCAR→base, advance to N+1
+     - If divergence detected and first attempt: retry iteration with retry folder
+     - If failure persists: stop with error
 ```
 
 ### STOPCAR/LABORT Timing
@@ -260,7 +263,24 @@ After each job completes, the script searches `iteration-N/OUTCAR` for the succe
 ./launch.sh --success-string "total energy"
 ```
 
-If the string is not found, the chain **stops** and logs the error.
+If a success string is provided and not found, the chain **stops** and logs the error.
+
+If no success string is provided, successful job completion (regardless of STOPCAR timing) is considered convergence.
+
+---
+
+## Divergence Detection and Retry
+
+The automation includes automatic divergence detection:
+
+- **Energy monitoring**: Checks if total energy is increasing in the last 3 ionic steps
+- **Force monitoring**: Warns if total force exceeds 1.0 eV/Å (potential convergence issues)
+- **Retry mechanism**: If divergence is detected, allows **one retry** of the same iteration
+  - Creates `iteration-N-retry/` folder
+  - Copies WAVECAR/CHGCAR from the failed iteration
+  - If retry also fails, stops the chain
+
+This helps recover from temporary numerical instabilities without manual intervention.
 
 ---
 

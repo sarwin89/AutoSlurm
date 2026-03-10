@@ -130,7 +130,7 @@ log_msg "Job name prefix:   $JOB_PREFIX"
 if [[ -n "$SUCCESS_STRING" ]]; then
     log_msg "Success string:    '$SUCCESS_STRING'"
 else
-    log_msg "Success criteria:  Early completion (no STOPCAR written)"
+    log_msg "Success criteria:  Successful job completion"
 fi
 log_msg "Monitor interval:  $MONITOR_INTERVAL seconds (${MONITOR_INTERVAL}s ≈ $((MONITOR_INTERVAL/60)) min)"
 log_msg "═════════════════════════════════════════════════════════════"
@@ -170,12 +170,27 @@ while [[ $iter -le $MAX_ITER ]]; do
     log_iter "$iter" "Copied input files (INCAR, POSCAR, KPOINTS, POTCAR)"
 
     # Copy restart files from base if they exist from previous iteration
-    for restart_file in WAVECAR CHGCAR; do
-        if [[ -f "${BASE_DIR}/${restart_file}" ]]; then
-            cp -f "${BASE_DIR}/${restart_file}" "${ITER_DIR}/"
-            log_iter "$iter" "Copied $restart_file for restart"
-        fi
-    done
+    if [[ $DIVERGENCE_RETRY -eq 1 ]]; then
+        ORIGINAL_ITER_DIR="${BASE_DIR}/iteration-${iter}"
+        # For retry, copy restart files from the original failed iteration if available
+        for restart_file in WAVECAR CHGCAR; do
+            if [[ -f "${ORIGINAL_ITER_DIR}/${restart_file}" ]]; then
+                cp -f "${ORIGINAL_ITER_DIR}/${restart_file}" "${ITER_DIR}/"
+                log_iter "$iter" "Copied $restart_file from failed iteration for retry"
+            elif [[ -f "${BASE_DIR}/${restart_file}" ]]; then
+                cp -f "${BASE_DIR}/${restart_file}" "${ITER_DIR}/"
+                log_iter "$iter" "Copied $restart_file from base for retry"
+            fi
+        done
+    else
+        # Normal copying from base
+        for restart_file in WAVECAR CHGCAR; do
+            if [[ -f "${BASE_DIR}/${restart_file}" ]]; then
+                cp -f "${BASE_DIR}/${restart_file}" "${ITER_DIR}/"
+                log_iter "$iter" "Copied $restart_file for restart"
+            fi
+        done
+    fi
 
     # ──────────────────────────────
     #   Submit job to SLURM
@@ -308,14 +323,9 @@ while [[ $iter -le $MAX_ITER ]]; do
                 SUCCESS=0
             fi
         else
-            # No success string - check if completed without STOPCAR (early convergence)
-            if [[ $STOPCAR_WRITTEN -eq 0 ]]; then
-                log_iter "$iter" "✓ SUCCESS: Job completed without STOPCAR (early convergence)"
-                SUCCESS=1
-            else
-                log_iter "$iter" "⚠ Job completed with STOPCAR written - may not be fully converged"
-                SUCCESS=0
-            fi
+            # No success string - successful completion is considered success
+            log_iter "$iter" "✓ SUCCESS: Job completed successfully"
+            SUCCESS=1
         fi
 
         # Handle divergence: allow one retry
