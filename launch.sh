@@ -16,7 +16,8 @@
 #   - Advancing iterations based on successful completion
 #
 #   Usage: ./launch.sh [--continue-from N] [--max-iter M] [--name JOB_PREFIX] \
-#                      [--success-string "text"] [--monitor-interval SECS]
+#                      [--success-string "text"] [--monitor-interval SECS] \
+#                      [--validate-only] [--help]
 #
 #   Example: ./launch.sh --continue-from 1 --max-iter 20 --name "MoS2-relax" \
 #                --success-string "reached structural accuracy" --monitor-interval 1800
@@ -45,7 +46,16 @@ BASE_DIR="$(pwd)"
 CHAIN_LOG="${BASE_DIR}/chain_$(date '+%Y%m%d_%H%M%S').log"
 SUBMIT_SCRIPT="${BASE_DIR}/submit.sh"
 
+VALIDATE_ONLY=0
 DIVERGENCE_RETRY=0
+
+print_usage() {
+    echo "Usage: $0 [--continue-from N] [--max-iter M] [--name PREFIX]"
+    echo "          [--success-string TEXT] [--monitor-interval SECS]"
+    echo "          [--validate-only] [--help]"
+    echo "Note: --success-string is optional. If not provided, early completion"
+    echo "      without STOPCAR is considered successful convergence."
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 #                         ARGUMENT PARSING
@@ -72,6 +82,14 @@ while [[ $# -gt 0 ]]; do
         --monitor-interval)
             MONITOR_INTERVAL="$2"
             shift 2
+            ;;
+        --validate-only)
+            VALIDATE_ONLY=1
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
             ;;
         *)
             echo "Unknown option: $1"
@@ -109,6 +127,19 @@ for file in INCAR.start INCAR.cont KPOINTS POSCAR POTCAR "$SUBMIT_SCRIPT"; do
         exit 1
     fi
 done
+
+if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
+    echo "Validation successful."
+    exit 0
+fi
+
+# redirect all subsequent output to the chain log so the script can be
+# backgrounded without cluttering the terminal; tail the log to monitor
+exec >"$CHAIN_LOG" 2>&1
+
+# note: log_msg()/log_iter() still use tee-append for readability when
+# running interactively, but because we've redirected the main shell the
+# terminal will no longer receive these lines unless you explicitly tee.
 
 # ──────────────────────────────────────────────────────────────────────────────
 #                         LOGGING FUNCTION

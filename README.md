@@ -14,13 +14,14 @@ Bash-based automation for iterative SLURM job submission, designed for computati
 # 3. Run setup check
 ./setup-check.sh
 
-# 4. Launch your iteration chain
-./launch.sh --name "my-calc" --max-iter 20 --success-string "reached structural accuracy"
+# 4. Launch your iteration chain (output is automatically written to
+#    a timestamped chain_*.log file; running in the background is safe)
+./launch.sh --name "my-calc" --max-iter 20 --success-string "reached structural accuracy" &
 
 # 5. Monitor progress
+#    (the script itself is quiet; watch the log or job outputs)
 tail -f chain_*.log
 ```
-
 ## Table of Contents
 
 - [What Was Created](#what-was-created)

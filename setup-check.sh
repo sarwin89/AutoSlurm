@@ -1,11 +1,9 @@
 #!/bin/bash
 ################################################################################
-#   setup-check.sh - Verify VASP automation setup
-#   
-#   Checks for required files, SLURM configuration, and provides diagnostics
-#   Usage: ./setup-check.sh [--fix]
-#   
-#   Use --fix flag to auto-create template files if missing
+# setup-check.sh - Verify VASP automation setup
+#
+# Checks for required files, SLURM configuration, and provides diagnostics.
+# Usage: ./setup-check.sh [--fix]
 ################################################################################
 
 set -euo pipefail
@@ -19,32 +17,36 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 check_pass() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}[OK]${NC} $1"
 }
 
 check_fail() {
-    echo -e "${RED}✗${NC} $1"
+    echo -e "${RED}[FAIL]${NC} $1"
 }
 
 check_warn() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
 check_info() {
-    echo -e "${BLUE}ℹ${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print_sep() {
+    echo "------------------------------------------------------------------"
+}
+
+print_sep
 echo "   VASP Automation Setup Checker"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print_sep
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         Check Required Files
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check Required Files
+# ------------------------------------------------------------------
 
 echo "Checking required files..."
 MISSING_COUNT=0
@@ -62,9 +64,9 @@ done
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         Check Script Permissions
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check Script Permissions and Line Endings
+# ------------------------------------------------------------------
 
 echo "Checking script permissions..."
 for script in launch.sh submit.sh; do
@@ -75,16 +77,27 @@ for script in launch.sh submit.sh; do
             check_warn "$script is not executable (should be)"
             if [[ $FIX_MODE -eq 1 ]]; then
                 chmod +x "$script"
-                check_pass "Fixed: Made $script executable"
+                check_pass "Fixed: made $script executable"
             fi
         fi
-        # detect Windows CRLF line endings
+
         if grep -q $'\r' "$script"; then
-            check_warn "$script contains CRLF line endings (run dos2unix or re-clone with LF)"
+            check_warn "$script contains CRLF line endings"
             if [[ $FIX_MODE -eq 1 ]]; then
                 sed -i 's/\r$//' "$script" && check_pass "Fixed: converted $script to LF"
             fi
         fi
+    fi
+done
+
+echo ""
+
+# ------------------------------------------------------------------
+# Check launch.sh Configuration
+# ------------------------------------------------------------------
+
+echo "Checking launch.sh configuration..."
+
 if grep -q "STOPCAR_TIME=79200" launch.sh; then
     check_pass "STOPCAR time set to 22 hours (79200s)"
 else
@@ -98,30 +111,57 @@ else
 fi
 
 if grep -q "MONITOR_INTERVAL=" launch.sh; then
-    INTERVAL=$(grep "MONITOR_INTERVAL=" launch.sh | head -1 | cut -d'=' -f2)
+    INTERVAL=$(grep "MONITOR_INTERVAL=" launch.sh | head -1 | cut -d'=' -f2 | sed 's/[[:space:]]*#.*//')
     check_info "Monitoring interval set to: $INTERVAL seconds"
 fi
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                      Check submit.sh SLURM Config
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check submit.sh SLURM Configuration
+# ------------------------------------------------------------------
 
 echo "Checking submit.sh SLURM configuration..."
 
-if grep -q "#SBATCH -N" submit.sh; then
-    NODES=$(grep "#SBATCH -N" submit.sh | head -1 | awk '{print $NF}')
+effective_sbatch_line=$(awk '/^[[:space:]]*#SBATCH[[:space:]]/ {print NR; exit}' submit.sh)
+effective_code_line=$(awk '/^[[:space:]]*$/ {next} /^[[:space:]]*#/ {next} {print NR; exit}' submit.sh)
+
+if [[ -z "$effective_sbatch_line" ]]; then
+    check_fail "No #SBATCH directives found in submit.sh"
+elif [[ -n "$effective_code_line" && "$effective_code_line" -lt "$effective_sbatch_line" ]]; then
+    check_fail "Executable content appears before #SBATCH directives; SLURM will ignore SBATCH settings"
+else
+    check_pass "SBATCH directives appear before executable shell code"
+fi
+
+extract_value() {
+    local line="$1"
+    line="$(echo "$line" | sed 's/[[:space:]]#.*$//')"
+    if [[ "$line" == *"="* ]]; then
+        echo "$line" | awk -F'=' '{print $NF}' | tr -d ' '
+    else
+        echo "$line" | awk '{print $NF}'
+    fi
+}
+
+if line=$(grep "#SBATCH -N" submit.sh | head -1); then
+    NODES=$(extract_value "$line")
     check_info "Number of nodes: $NODES"
+    if ! [[ "$NODES" =~ ^[0-9]+$ ]]; then
+        check_warn "Nodes value '$NODES' looks non-numeric (check SBATCH -N directive)"
+    fi
 fi
 
-if grep -q "#SBATCH --ntasks-per-node" submit.sh; then
-    TASKS=$(grep "#SBATCH --ntasks-per-node" submit.sh | head -1 | awk '{print $NF}')
+if line=$(grep "#SBATCH --ntasks-per-node" submit.sh | head -1); then
+    TASKS=$(extract_value "$line")
     check_info "Tasks per node: $TASKS"
+    if ! [[ "$TASKS" =~ ^[0-9]+$ ]]; then
+        check_warn "Tasks-per-node value '$TASKS' looks non-numeric (check SBATCH directive)"
+    fi
 fi
 
-if grep -q "#SBATCH --time" submit.sh; then
-    TIME=$(grep "#SBATCH --time" submit.sh | head -1 | awk '{print $NF}')
+if line=$(grep "#SBATCH --time" submit.sh | head -1); then
+    TIME=$(extract_value "$line")
     check_info "Walltime limit: $TIME"
     if [[ "$TIME" == "24:00:00" ]]; then
         check_pass "Walltime is 24 hours (correct for STOPCAR at 22h)"
@@ -130,16 +170,23 @@ if grep -q "#SBATCH --time" submit.sh; then
     fi
 fi
 
-if grep -q "#SBATCH --partition" submit.sh; then
-    PARTITION=$(grep "#SBATCH --partition" submit.sh | head -1 | awk '{print $NF}')
+if line=$(grep "#SBATCH --partition" submit.sh | head -1); then
+    PARTITION=$(extract_value "$line")
     check_warn "Partition set to: $PARTITION (verify this matches your cluster)"
+    if [[ "${PARTITION,,}" == *gpu* ]]; then
+        check_warn "Partition name contains 'gpu' - this may queue on GPU nodes"
+    fi
+fi
+
+if grep -qi "gres.*gpu" submit.sh; then
+    check_warn "submit.sh appears to request GPUs (check SBATCH directives)"
 fi
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         Check INCAR Files
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check INCAR Files
+# ------------------------------------------------------------------
 
 echo "Checking INCAR files..."
 
@@ -170,9 +217,9 @@ fi
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         Check VASP Input Files
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check VASP Input Files
+# ------------------------------------------------------------------
 
 echo "Checking VASP input files..."
 
@@ -186,9 +233,9 @@ done
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                      Check SLURM Availability
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Check SLURM Availability
+# ------------------------------------------------------------------
 
 echo "Checking SLURM availability..."
 
@@ -212,25 +259,25 @@ fi
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         Test Mode Dry-Run
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Test Mode Dry-Run
+# ------------------------------------------------------------------
 
 echo "Testing launch.sh dry-run (argument parsing)..."
 
-if ./launch.sh --help 2>&1 | grep -q "Usage:"; then
-    check_pass "launch.sh help works"
-elif ./launch.sh 2>&1 | grep -q "Error"; then
-    check_pass "launch.sh validates arguments"
+if ./launch.sh --validate-only >/dev/null 2>&1; then
+    check_pass "launch.sh validation mode works (no job submission)"
+else
+    check_fail "launch.sh validation mode failed (run ./launch.sh --validate-only for details)"
 fi
 
 echo ""
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                            Summary
-# ──────────────────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
+# Summary
+# ------------------------------------------------------------------
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print_sep
 
 if [[ $MISSING_COUNT -gt 0 ]]; then
     echo -e "${RED}Setup incomplete: $MISSING_COUNT files missing${NC}"
@@ -248,4 +295,4 @@ else
     echo ""
 fi
 
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+print_sep

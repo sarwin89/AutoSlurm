@@ -1,13 +1,11 @@
 #!/bin/bash
 #SBATCH --job-name=vasp-job          # Replace with your job name
-#SBATCH --partition=standard         # Replace with your partition name
+#SBATCH --partition=cpu              # Replace with your partition name
 #SBATCH --output=job.%j.out          # %j will be replaced with job ID
 #SBATCH --error=job.%j.err           # %j will be replaced with job ID
-#SBATCH --nodes=n                    # Number of nodes
+#SBATCH --nodes=8                    # Number of nodes
 #SBATCH --ntasks-per-node=24         # Tasks per node
-#SBATCH --ntasks=n*24                # Total tasks (nodes * ntasks-per-node)
-#SBATCH --time=24:00:00              # Walltime limit
-#SBATCH --qos=normal                 # QoS (if applicable)
+#SBATCH --ntasks=192                 # Total tasks (nodes * ntasks-per-node)
 
 # Always start from submission directory
 cd $SLURM_SUBMIT_DIR || exit 1
