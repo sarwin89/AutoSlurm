@@ -1,457 +1,244 @@
-# VASP Iteration Chain Automation Guide
+# AutoSlurm Automation Guide
 
-Complete automated solution for running iterative VASP calculations with proper queue handling, STOPCAR writing, and convergence checking.
+## Purpose
 
-## Overview
+This guide describes the current centralized AutoSlurm workflow (validated on March 11, 2026):
+- scripts live in one shared AutoSlurm directory
+- each calculation has its own work directory with VASP inputs and iteration folders
+- logs can be written to a shared log directory
+- runtime monitoring uses `squeue`
 
-The automation consists of two main scripts:
+## Directory Model
 
-- **`launch.sh`** - Orchestrator that manages the entire iteration chain
-- **`submit.sh`** - VASP job runner that gets submitted to SLURM
+Example:
 
-### Key Features
+```text
+/pfs/home/shobhana/sarwin/AutoSlurm/
+  launch.sh
+  submit.sh
+  setup-check.sh
+  reset-run.sh
+  logs/
 
-✓ **Queue-aware STOPCAR/LABORT timing** - Detects actual compute time (excluding queue) and writes STOPCAR at 22h, LABORT at 23h  
-✓ **Automatic iteration foldering** - Creates `iteration-N` folders with proper INCAR management  
-✓ **Job monitoring & logging** - Monitors status every 30-60 min, logs to timestamped chain log  
-✓ **Checkpoint file handling** - Automatically copies WAVECAR/CHGCAR between iterations  
-✓ **Success string validation** - Checks OUTCAR for user-defined convergence string (optional)  
-✓ **Divergence detection & retry** - Monitors for energy increase/force issues, allows one retry  
-✓ **Resume capability** - Can restart from any iteration  
-
----
-
-## Setup
-
-### Prerequisites
-
-In your base working directory, you need:
-
-```
-.
-├── launch.sh          # Main orchestrator (provided)
-├── submit.sh          # VASP job runner (provided)
-├── INCAR.start        # INCAR for first iteration
-├── INCAR.cont         # INCAR for iterations 2+
-├── KPOINTS            # k-points file
-├── POSCAR             # Initial structure
-└── POTCAR             # Pseudopotential file
+/pfs/home/shobhana/sarwin/bilayer-7/test/
+  INCAR.start
+  INCAR.cont
+  KPOINTS
+  POSCAR
+  POTCAR
+  iteration-1/
+  iteration-2/
+  ...
 ```
 
-### File Descriptions
+## One-Time Cluster Configuration
 
-#### INCAR.start vs INCAR.cont
+Edit `submit.sh` for your cluster:
+- `#SBATCH --partition=...`
+- `#SBATCH -N ...`
+- `#SBATCH --ntasks-per-node=...`
+- `#SBATCH --time=24:00:00`
+- module loads required for MPI and VASP
 
-- **INCAR.start**: Used only for iteration 1. Typically includes full SCF setup from scratch
-- **INCAR.cont**: Used for iterations 2 and beyond. Should enable `ISTART=1` to read WAVECAR/CHGCAR from previous iteration
+`submit.sh` now validates `VASP_EXE` before launching MPI and fails with exit code `127` if not found.
 
-**INCAR.start** (first iteration - fresh start):
-```
-! First iteration - fresh start without restart files
-SYSTEM = MoS2 Bilayer Structure
+## Inputs Required Per Work Directory
 
-! Electronic relaxation
-PREC   = Accurate
-ENCUT  = 400
-ISTART = 0           ! Fresh start (no WAVECAR)
-ICHARG = 2           ! Build charge density from scratch
+Each `--workdir` must contain:
+- `INCAR.start`
+- `INCAR.cont`
+- `KPOINTS`
+- `POSCAR`
+- `POTCAR`
 
-! Ionic relaxation
-IBRION = 2           ! CG relaxation algorithm
-NSW    = 100         ! Max 100 ionic steps
-POTIM  = 0.5         ! Timestep for ionic motion
-ISIF   = 3           ! Relax ions and cell volume
-EDIFFG = -0.01       ! Energy convergence criterion
+Optional restart files used automatically:
+- `WAVECAR`
+- `CHGCAR`
 
-! SCF convergence
-NELM   = 100         ! Max 100 electronic steps
-NELMIN = 4
-EDIFF  = 1e-04       ! SCF convergence
-
-! Output
-LWAVE  = .TRUE.      ! Write WAVECAR
-LCHARG = .TRUE.      ! Write CHGCAR
-NWRITE = 2
-
-! Smearing for metals (adjust for your system)
-ISMEAR = 1           ! Methfessel-Paxton order 1
-SIGMA  = 0.05        ! Smearing width
-
-! Parallelization
-NPAR   = 4
-KPAR   = 1
-```
-
-**INCAR.cont** (iterations 2+ - continue from checkpoint):
-```
-! Continuation iteration - read from previous WAVECAR
-SYSTEM = MoS2 Bilayer Structure
-
-! Electronic relaxation
-PREC   = Accurate
-ENCUT  = 400
-ISTART = 1           ! Read WAVECAR from previous iteration
-ICHARG = 1           ! Read charge density from CHGCAR
-ICHARGE = 0          ! Neutral charge
-
-! Ionic relaxation (same as start, or tighter)
-IBRION = 2           ! CG algorithm
-NSW    = 100         ! Max 100 ionic steps per iteration
-POTIM  = 0.5         ! Timestep
-ISIF   = 3           ! Relax ions and cell
-EDIFFG = -0.01       ! Convergence check
-
-! SCF convergence
-NELM   = 100
-NELMIN = 4
-EDIFF  = 1e-04
-
-! Output
-LWAVE  = .TRUE.      ! Overwrite WAVECAR for next iteration
-LCHARG = .TRUE.      ! Overwrite CHGCAR for next iteration
-NWRITE = 2
-
-! Smearing
-ISMEAR = 1
-SIGMA  = 0.05
-
-! Parallelization
-NPAR   = 4
-KPAR   = 1
-```
-
-**Key differences:**
-- `ISTART = 1` to read from WAVECAR
-- `ICHARG = 1` to read from CHGCAR
-- Remove `ICHARGE = 2` (not needed when reading charge)
-
-### SLURM Configuration
-
-Edit the SBATCH directives in `submit.sh` to match your cluster:
+## Commands (Recommended Flow)
 
 ```bash
-#SBATCH --partition=standard    # Your partition name
-#SBATCH --qos=small             # Your QoS
-#SBATCH -N 2                    # Number of nodes
-#SBATCH --ntasks-per-node=40    # Tasks per node
-#SBATCH --time=24:00:00         # Total walltime (must be 24+ hours)
+AUTOSLURM=/pfs/home/shobhana/sarwin/AutoSlurm
+JOBDIR=/pfs/home/shobhana/sarwin/bilayer-7/test
+LOGDIR=$AUTOSLURM/logs
+VASP_EXE=/pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std
+
+chmod +x "$AUTOSLURM"/launch.sh "$AUTOSLURM"/setup-check.sh "$AUTOSLURM"/submit.sh "$AUTOSLURM"/reset-run.sh
+
+# setup-check supports --workdir and --submit-script only
+"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
+
+"$AUTOSLURM"/launch.sh --validate-only \
+  --workdir "$JOBDIR" \
+  --log-dir "$LOGDIR" \
+  --vasp-exe "$VASP_EXE"
+
+"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --log-dir "$LOGDIR" --yes
+
+"$AUTOSLURM"/launch.sh \
+  --workdir "$JOBDIR" \
+  --log-dir "$LOGDIR" \
+  --name "AST-7r" \
+  --max-iter 5 \
+  --success-string "stopping structural energy minimisation" \
+  --monitor-interval 120 \
+  --vasp-exe "$VASP_EXE"
 ```
 
-The scripts assume you have loaded the Intel compiler and MPI modules. Verify the module commands in `submit.sh` match your cluster.
+## Script Behavior
 
----
+### launch.sh
 
-## Usage
+1. Validates arguments and required input files in `--workdir`.
+2. Creates `iteration-N` directory.
+3. Copies input files (`INCAR`, `POSCAR`, `KPOINTS`, `POTCAR`).
+4. Copies optional restart files (`WAVECAR`, `CHGCAR`) if present.
+5. Submits `submit.sh` with `sbatch` and per-iteration job name/output.
+6. Monitors with:
+   - `squeue -h -j <jobid> -o "%T|%M"`
+7. Writes:
+   - `STOPCAR` at 22h (`79200s`) while `RUNNING`
+   - `LABORT` at 23h (`82800s`) while `RUNNING`
+8. After completion:
+   - checks `OUTCAR`
+   - validates success string when provided
+   - requires non-empty `CONTCAR`
+   - copies `CONTCAR -> POSCAR` in workdir
+   - copies `WAVECAR/CHGCAR` back to workdir
 
-### Basic Usage
+### submit.sh
+
+- Uses cluster `#SBATCH` defaults.
+- Loads module environment.
+- Accepts VASP executable by:
+  - `--vasp-exe` from launch (exported as env var), or
+  - pre-exported `VASP_EXE`, or
+  - fallback `vasp_std` in PATH.
+- Emits clear error if executable is not found.
+
+### setup-check.sh
+
+- Checks script presence and permissions.
+- Checks workdir input files.
+- Parses key SBATCH directives from submit script.
+- Confirms launcher validation mode works.
+- Notes `sacct` as optional; workflow itself is `squeue` based.
+
+### reset-run.sh
+
+- Cleans:
+  - `iteration-*`
+  - `chain_*.log`, `job.*.out`, `job.*.err` in workdir
+  - matching job-tag logs in `--log-dir`
+- Supports `--yes` for non-interactive cleanup.
+
+## Option Reference
+
+### launch.sh
+
+```text
+--workdir PATH
+--log-dir PATH
+--submit-script PATH
+--vasp-exe PATH_OR_CMD
+--continue-from N
+--max-iter N
+--name PREFIX
+--success-string TEXT
+--monitor-interval SEC
+--validate-only
+```
+
+### setup-check.sh
+
+```text
+--workdir PATH
+--submit-script PATH
+--fix
+```
+
+### reset-run.sh
+
+```text
+--workdir PATH
+--log-dir PATH
+--yes
+```
+
+## Monitoring and Debugging
+
+Queue and runtime:
 
 ```bash
-./launch.sh --name "MoS2-relax" \
-            --success-string "reached structural accuracy" \
-            --continue-from 1 \
-            --max-iter 20 \
-            --monitor-interval 1800
+squeue -j <jobid>
+squeue -h -j <jobid> -o "%T|%M|%L|%N"
 ```
 
-### Arguments
+Log tail:
 
-| Argument | Default | Description |
-|----------|---------|-------------|
-| `--name PREFIX` | `VASP-calc` | Job name prefix (becomes `NAME-iter-N` in SLURM) |
-| `--success-string TEXT` | `reached structural accuracy` | String to search for in OUTCAR to mark iteration as successful |
-| `--continue-from N` | `1` | Starting iteration number |
-| `--max-iter M` | `20` | Maximum iteration number |
-| `--monitor-interval SECS` | `1800` | How often to check job status (30 min = 1800 s) |
-
-### Common Examples
-
-**First-time run with 10 iterations:**
 ```bash
-nohup ./launch.sh --name "bil-27-relax" \
-                  --max-iter 10 \
-                  --success-string "reached structural accuracy" > launch.log 2>&1 &
+tail -f "$LOGDIR"/chain_$(basename "$JOBDIR")_*.log
 ```
 
-**Resume from iteration 5:**
+Iteration files:
+
 ```bash
-./launch.sh --continue-from 5 --max-iter 20
+ls -lah "$JOBDIR"/iteration-1
+tail -n 50 "$JOBDIR"/iteration-1/OUTCAR
+tail -n 50 "$JOBDIR"/iteration-1/vasp.log
 ```
 
-**Fast monitoring (every 10 min) for SCF runs:**
+Launcher process check:
+
 ```bash
-./launch.sh --name "scf" \
-            --success-string "total energy" \
-            --monitor-interval 600 \
-            --max-iter 5
+pgrep -af launch.sh
 ```
 
----
+## Known Failure Modes and Fixes
 
-## How It Works
+### `Unknown option: --log-dir` from setup-check
 
-### Iteration Flow
+Cause: `setup-check.sh` does not support `--log-dir`.
 
-```
-For each iteration N:
-  1. Create iteration-N/ folder
-  2. Copy INCAR.start (if N=1) or INCAR.cont (if N>1) as INCAR
-  3. Copy POSCAR, KPOINTS, POTCAR
-  4. Copy WAVECAR, CHGCAR from base (if exist)
-  5. Submit job: sbatch --chdir=iteration-N --job-name=NAME-iter-N submit.sh
-  6. Poll job status every MONITOR_INTERVAL seconds
-  7. At 22h actual runtime: write STOPCAR with LSTOP=.TRUE.
-  8. At 23h actual runtime: write LABORT=.TRUE. to STOPCAR
-  9. When job finishes:
-     - Check OUTCAR for SUCCESS_STRING (if provided)
-     - Check for divergence (energy increasing, high forces)
-     - If success: copy CONTCAR→POSCAR, WAVECAR/CHGCAR→base, advance to N+1
-     - If divergence detected and first attempt: retry iteration with retry folder
-     - If failure persists: stop with error
-```
-
-### STOPCAR/LABORT Timing
-
-The scripts track **actual compute time** (not queue time):
-
-- `sacct` is queried every `MONITOR_INTERVAL` to get elapsed time
-- At **22 hours** of actual running: `STOPCAR` with `LSTOP = .TRUE.` is written
-- At **23 hours** of actual running: `LABORT = .TRUE.` is added to STOPCAR
-- VASP terminates gracefully via LSTOP, or LABORT as final fallback
-
-This ensures the next iteration has time to start before the 24h hard limit.
-
-### Job Monitoring & Logging
-
-All activity is logged to a timestamped file: `chain_YYYYMMDD_HHMMSS.log`
-
-Example log excerpt:
-```
-[2026-03-04 14:30:15]  ═════════════════════════════════════════════════════════════
-[2026-03-04 14:30:15]  VASP Chain Automation Started
-[2026-03-04 14:30:15]  Base directory:    /home/user/MoS2
-[2026-03-04 14:30:15]  Iterations:        1 → 20
-[2026-03-04 14:30:15]  Job name prefix:   MoS2-relax
-[2026-03-04 14:30:15]  Success string:    reached structural accuracy
-[2026-03-04 14:30:15]  ═════════════════════════════════════════════════════════════
-[2026-03-04 14:30:16]  [ITER-1]  ────────────────────────────────────────────────
-[2026-03-04 14:30:16]  [ITER-1]  Preparing iteration 1 of 20
-[2026-03-04 14:30:18]  [ITER-1]  Copied input files (INCAR, POSCAR, KPOINTS, POTCAR)
-[2026-03-04 14:30:19]  [ITER-1]  Submitted → Job ID: 12345678
-[2026-03-04 14:30:20]  [ITER-1]  Starting job monitoring
-[2026-03-04 14:35:20]  [ITER-1]  [Check 1] Status: PENDING | Elapsed: 00:00:04
-[2026-03-04 14:40:23]  [ITER-1]  [Check 2] Status: RUNNING | Elapsed: 00:05:07
-...
-[2026-03-04 14:30:15]  [ITER-1]  ✓ Written STOPCAR (LSTOP = .TRUE.) at 22:00:34
-```
-
-### Success String Checking
-
-After each job completes, the script searches `iteration-N/OUTCAR` for the success string:
-
-**For relaxations:**
+Fix:
 ```bash
-./launch.sh --success-string "reached structural accuracy"
+"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
 ```
 
-**For SCF calculations:**
+### `execvp error on file vasp_std (No such file or directory)`
+
+Cause: VASP executable not available on compute node PATH.
+
+Fix:
 ```bash
-./launch.sh --success-string "total energy(sigma"
+"$AUTOSLURM"/launch.sh ... --vasp-exe /absolute/path/to/vasp_std
 ```
-
-**For band structure:**
+or export before launch:
 ```bash
-./launch.sh --success-string "total energy"
+export VASP_EXE=/absolute/path/to/vasp_std
 ```
 
-If a success string is provided and not found, the chain **stops** and logs the error.
-
-If no success string is provided, successful job completion (regardless of STOPCAR timing) is considered convergence.
-
----
-
-## Divergence Detection and Retry
-
-The automation includes automatic divergence detection:
-
-- **Energy monitoring**: Checks if total energy is increasing in the last 3 ionic steps
-- **Force monitoring**: Warns if total force exceeds 1.0 eV/Å (potential convergence issues)
-- **Retry mechanism**: If divergence is detected, allows **one retry** of the same iteration
-  - Creates `iteration-N-retry/` folder
-  - Copies WAVECAR/CHGCAR from the failed iteration
-  - If retry also fails, stops the chain
-
-This helps recover from temporary numerical instabilities without manual intervention.
-
----
-
-## Troubleshooting
-
-### Job never starts (stays PENDING)
-
-The job is in the queue. The script will wait. Monitor with:
-```bash
-squeue -j <job-id>
-```
-
-### STOPCAR/LABORT not written
+### Chain appears stuck while job is running
 
 Check:
-1. Job is actually running (status = RUNNING)
-2. Iteration folder has proper permissions
-3. Check chain log for which check found the condition
+- launcher still running: `pgrep -af launch.sh`
+- monitor interval value (`--monitor-interval`)
+- queue status directly with `squeue`
 
-### "Success string not found" error
+## Practical Defaults
 
-1. Verify the success string matches your calculation type
-2. Check `iteration-N/OUTCAR` manually to find the actual completion message
-3. Use `--success-string "your-string"` with the correct text
+- `--monitor-interval 120` for short debugging runs
+- `--monitor-interval 1800` for production
+- `--max-iter 2` for smoke tests
+- `--max-iter 20+` for full relax workflows
 
-### Job status shows COMPLETED but no OUTCAR
+## Validation Snapshot (March 11, 2026)
 
-This is a job crash. Check:
-- `iteration-N/job.*.err` for error messages
-- `iteration-N/job.*.out` for VASP stdout
-- Module loading in `submit.sh`
+Observed good behavior:
+- setup-check passes for centralized path model
+- launch validates with explicit workdir/logdir/vasp-exe
+- job submits to CPU partition
+- monitor shows state transitions (`PENDING -> RUNNING`)
+- queue reflects expected running job
 
-### Wrong INCAR being used
-
-1. Verify files exist: `ls INCAR.start INCAR.cont`
-2. Check first few lines are copied to `iteration-1/INCAR`
-3. For iterations 2+, check `iteration-N/INCAR` starts with correct settings
-
-### WAVECAR/CHGCAR not being copied
-
-1. After iteration 1 completes, verify files exist: `ls iteration-1/WAVECAR iteration-1/CHGCAR`
-2. Check base directory for copied files: `ls WAVECAR CHGCAR`
-3. If missing, VASP didn't write them (check ISTART in INCAR.start)
-
----
-
-## Advanced Usage
-
-### Running in Background
-
-```bash
-nohup ./launch.sh --name "long-calc" --max-iter 50 > launch.log 2>&1 &
-```
-
-Then monitor:
-```bash
-tail -f launch.log
-```
-
-### Multiple Chains
-
-Run different calculations in separate directories:
-```bash
-/path/to/relax/$ nohup ./launch.sh --name "relax" --max-iter 20 &
-/path/to/scf/$ nohup ./launch.sh --name "scf" --max-iter 5 &
-```
-
-Each creates its own `chain_*.log`.
-
-### Custom Monitor Interval
-
-For **fast-converging systems** that finish < 1 hour per iter:
-```bash
-./launch.sh --monitor-interval 300    # Check every 5 minutes
-```
-
-For **slow systems** to reduce system load:
-```bash
-./launch.sh --monitor-interval 3600   # Check every 1 hour
-```
-
-### Partial Restart After Failure
-
-If iteration 5 fails, fix the issue and restart:
-```bash
-cd iteration-5/
-# Fix POSCAR or INCAR as needed
-cd ..
-./launch.sh --continue-from 5    # Will reuse iteration-5 folder or create new one
-```
-
-Actually, to be safer, rename the failed folder and restart:
-```bash
-mv iteration-5 iteration-5-failed
-./launch.sh --continue-from 5    # Creates fresh iteration-5
-```
-
----
-
-## Performance & Resource Tips
-
-### MPI Settings in submit.sh
-
-The scripts use `mpiexec.hydra` based on the tested `submit-cpu.sh`:
-```bash
-MPI_CMD="mpiexec.hydra -genv I_MPI_FABRICS shm:ofa \
-                       -genv I_MPI_DEVICE rdma \
-                       -machinefile $MACHINE_FILE \
-                       -np $SLURM_NTASKS"
-```
-
-Adjust if your cluster uses different MPI:
-- **OpenMPI**: Use `mpirun -np $SLURM_NTASKS`
-- **Different interconnect**: Change `I_MPI_FABRICS` and `I_MPI_DEVICE`
-
-### Optimizing Iteration Timing
-
-For relaxations that converge quickly:
-- Use smaller `--monitor-interval` (e.g., 600s)
-- Use smaller `NSW` in INCAR to keep iterations short
-- Use smaller `--max-iter` and increase later if needed
-
-### Disk Space
-
-Iterations create large DOSCAR/IBZKPT files. Optional cleanup in each iteration-N:
-```bash
-rm -f iteration-N/DOSCAR iteration-N/IBZKPT
-```
-
-Add to `submit.sh` after VASP finishes if needed.
-
----
-
-## Files Generated
-
-### Per Iteration
-
-```
-iteration-N/
-├── INCAR                 # Input file (copied from INCAR.start or INCAR.cont)
-├── POSCAR               # Atomic positions input
-├── KPOINTS              # k-point mesh
-├── POTCAR               # Pseudopotentials
-├── CONTCAR              # Output atomic positions
-├── OUTCAR               # Main output (checked for success string)
-├── job.JOBID.out        # SLURM stdout
-├── job.JOBID.err        # SLURM stderr
-├── STOPCAR              # Written by launch.sh at 22h/23h
-├── WAVECAR              # Wavefunction restart (copied in from base)
-├── CHGCAR               # Charge density restart (copied in from base)
-└── [other VASP outputs...]
-```
-
-### Base Directory
-
-```
-.
-├── POSCAR               # Updated after each iteration
-├── WAVECAR              # Copied from latest iteration
-├── CHGCAR               # Copied from latest iteration
-└── chain_YYYYMMDD_HHMMSS.log   # Timestamped chain log
-```
-
----
-
-## Summary
-
-1. **Prepare**: INCAR.start, INCAR.cont, KPOINTS, POSCAR, POTCAR
-2. **Configure**: Edit `submit.sh` for SLURM directives (partition, QoS, nodes, etc.)
-3. **Run**: `./launch.sh --name "yourjob" --success-string "your string"`
-4. **Monitor**: `tail -f chain_*.log` or `squeue -u $USER`
-5. **Results**: Check `iteration-N/OUTCAR` and copied POSCAR/WAVECAR/CHGCAR in base
-
-The scripts handle everything else: iterations, queue waiting, STOPCAR timing, success checking, and restart file management.
+This is the current expected baseline for AutoSlurm.

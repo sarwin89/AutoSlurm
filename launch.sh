@@ -1,68 +1,68 @@
 #!/bin/bash
 ################################################################################
-#   launch.sh - Automated VASP iteration chain orchestrator
-#   
-#   NOTE: this script is intended for Linux/batch systems.  If it has
-#   Windows-style CRLF line endings the kernel will complain; the script
-#   will attempt to normalise itself on the first invocation.
-#   
-#   Handles:
-#   - Creating iteration folders with proper INCAR/POSCAR/KPOINTS/POTCAR
-#   - Submitting jobs to SLURM  
-#   - Monitoring job status every 30-60 minutes
-#   - Writing STOPCAR/LABORT at 22h/23h of actual compute time (excluding queue)
-#   - Checking success criteria in OUTCAR
-#   - Logging all activity to a chain log file
-#   - Advancing iterations based on successful completion
+# launch.sh - Automated VASP iteration orchestrator (squeue-only monitoring)
 #
-#   Usage: ./launch.sh [--continue-from N] [--max-iter M] [--name JOB_PREFIX] \
-#                      [--success-string "text"] [--monitor-interval SECS] \
-#                      [--validate-only] [--help]
+# Centralized usage:
+#   Keep this script + submit.sh in one AutoSlurm folder.
+#   Keep VASP inputs in a separate work directory.
 #
-#   Example: ./launch.sh --continue-from 1 --max-iter 20 --name "MoS2-relax" \
-#                --success-string "reached structural accuracy" --monitor-interval 1800
+# Example:
+#   ./launch.sh --workdir /path/to/jobA --name "jobA" --max-iter 10 \
+#       --success-string "stopping structural energy minimisation"
 ################################################################################
 
 set -euo pipefail
 
-# convert this script to Unix line endings if accidentally checked out with CRLF
-if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
-    sed -i 's/\r$//' "${BASH_SOURCE[0]}" || true
-fi
-
-# ──────────────────────────────────────────────────────────────────────────────
-#                           DEFAULTS & SETUP
-# ──────────────────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CONTINUE_FROM=1
 MAX_ITER=20
 JOB_PREFIX="VASP-calc"
-SUCCESS_STRING=""  # Optional: if empty, early completion without STOPCAR is success
-MONITOR_INTERVAL=1800                          # 30 minutes in seconds
-STOPCAR_TIME=79200                            # 22 hours of actual run time (seconds)
-LABORT_TIME=82800                             # 23 hours of actual run time (seconds)
-
-BASE_DIR="$(pwd)"
-CHAIN_LOG="${BASE_DIR}/chain_$(date '+%Y%m%d_%H%M%S').log"
-SUBMIT_SCRIPT="${BASE_DIR}/submit.sh"
-
+SUCCESS_STRING=""
+MONITOR_INTERVAL=1800
+STOPCAR_TIME=79200
+LABORT_TIME=82800
+WORK_DIR="$(pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
+VASP_EXE_OVERRIDE=""
 VALIDATE_ONLY=0
-DIVERGENCE_RETRY=0
 
 print_usage() {
-    echo "Usage: $0 [--continue-from N] [--max-iter M] [--name PREFIX]"
-    echo "          [--success-string TEXT] [--monitor-interval SECS]"
-    echo "          [--validate-only] [--help]"
-    echo "Note: --success-string is optional. If not provided, early completion"
-    echo "      without STOPCAR is considered successful convergence."
+    echo "Usage: $0 [options]"
+    echo ""
+    echo "Options:"
+    echo "  --workdir PATH          Directory containing INCAR.start/INCAR.cont/POSCAR/KPOINTS/POTCAR"
+    echo "  --log-dir PATH          Directory where chain logs are written (default: ${SCRIPT_DIR}/logs)"
+    echo "  --submit-script PATH    Submit script path (default: ${SCRIPT_DIR}/submit.sh)"
+    echo "  --vasp-exe PATH_OR_CMD  Override VASP executable for submit.sh (optional)"
+    echo "  --continue-from N       Iteration number to start from (default: 1)"
+    echo "  --max-iter N            Last iteration number (default: 20)"
+    echo "  --name PREFIX           Job name prefix (default: VASP-calc)"
+    echo "  --success-string TEXT   Required success text in OUTCAR (optional)"
+    echo "  --monitor-interval SEC  Status poll interval in seconds (default: 1800)"
+    echo "  --validate-only         Validate config and exit (no job submission)"
+    echo "  -h, --help              Show this help"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         ARGUMENT PARSING
-# ──────────────────────────────────────────────────────────────────────────────
-
 while [[ $# -gt 0 ]]; do
-    case $1 in
+    case "$1" in
+        --workdir)
+            WORK_DIR="$2"
+            shift 2
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
+        --submit-script)
+            SUBMIT_SCRIPT="$2"
+            shift 2
+            ;;
+        --vasp-exe)
+            VASP_EXE_OVERRIDE="$2"
+            shift 2
+            ;;
         --continue-from)
             CONTINUE_FROM="$2"
             shift 2
@@ -93,350 +93,328 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--continue-from N] [--max-iter M] [--name PREFIX]"
-            echo "          [--success-string TEXT] [--monitor-interval SECS]"
-            echo "Note: --success-string is optional. If not provided, early completion"
-            echo "      without STOPCAR is considered successful convergence."
+            print_usage
             exit 1
             ;;
     esac
 done
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-#                       VALIDATION & FILE CHECKS
-# ──────────────────────────────────────────────────────────────────────────────
-
 if ! [[ "$CONTINUE_FROM" =~ ^[0-9]+$ ]] || [[ "$CONTINUE_FROM" -lt 1 ]]; then
-    echo "Error: --continue-from must be integer >= 1"
-    exit 1
-fi
-if ! [[ "$MAX_ITER" =~ ^[0-9]+$ ]] || [[ "$MAX_ITER" -lt "$CONTINUE_FROM" ]]; then
-    echo "Error: --max-iter must be >= --continue-from"
-    exit 1
-fi
-if ! [[ "$MONITOR_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$MONITOR_INTERVAL" -lt 60 ]]; then
-    echo "Error: --monitor-interval must be >= 60 seconds"
+    echo "Error: --continue-from must be an integer >= 1"
     exit 1
 fi
 
-# Verify required files exist
-for file in INCAR.start INCAR.cont KPOINTS POSCAR POTCAR "$SUBMIT_SCRIPT"; do
-    if [[ ! -f "$file" ]]; then
-        echo "Error: Required file not found: $file"
+if ! [[ "$MAX_ITER" =~ ^[0-9]+$ ]] || [[ "$MAX_ITER" -lt "$CONTINUE_FROM" ]]; then
+    echo "Error: --max-iter must be an integer >= --continue-from"
+    exit 1
+fi
+
+if ! [[ "$MONITOR_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$MONITOR_INTERVAL" -lt 60 ]]; then
+    echo "Error: --monitor-interval must be an integer >= 60"
+    exit 1
+fi
+
+if [[ ! -d "$WORK_DIR" ]]; then
+    echo "Error: --workdir does not exist: $WORK_DIR"
+    exit 1
+fi
+
+WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+if [[ "$LOG_DIR" != /* ]]; then
+    LOG_DIR="${SCRIPT_DIR}/${LOG_DIR}"
+fi
+
+if [[ "$SUBMIT_SCRIPT" != /* ]]; then
+    SUBMIT_SCRIPT="${SCRIPT_DIR}/${SUBMIT_SCRIPT}"
+fi
+
+if [[ ! -f "$SUBMIT_SCRIPT" ]]; then
+    echo "Error: submit script not found: $SUBMIT_SCRIPT"
+    exit 1
+fi
+
+required_files=("INCAR.start" "INCAR.cont" "KPOINTS" "POSCAR" "POTCAR")
+for req in "${required_files[@]}"; do
+    if [[ ! -f "$WORK_DIR/$req" ]]; then
+        echo "Error: required input file missing: $WORK_DIR/$req"
         exit 1
     fi
 done
 
 if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
     echo "Validation successful."
+    echo "  Work dir:      $WORK_DIR"
+    echo "  Log dir:       $LOG_DIR"
+    echo "  Submit script: $SUBMIT_SCRIPT"
+    if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
+        echo "  VASP exe:      $VASP_EXE_OVERRIDE"
+    else
+        echo "  VASP exe:      (from submit.sh default/env)"
+    fi
+    echo "  Iterations:    $CONTINUE_FROM -> $MAX_ITER"
+    echo "  Monitor every: $MONITOR_INTERVAL seconds"
     exit 0
 fi
 
-# redirect all subsequent output to the chain log so the script can be
-# backgrounded without cluttering the terminal; tail the log to monitor
-exec >"$CHAIN_LOG" 2>&1
-
-# note: log_msg()/log_iter() still use tee-append for readability when
-# running interactively, but because we've redirected the main shell the
-# terminal will no longer receive these lines unless you explicitly tee.
-
-# ──────────────────────────────────────────────────────────────────────────────
-#                         LOGGING FUNCTION
-# ──────────────────────────────────────────────────────────────────────────────
+mkdir -p "$LOG_DIR"
+JOB_TAG="$(basename "$WORK_DIR" | tr -cs 'A-Za-z0-9._-' '_')"
+CHAIN_LOG="${LOG_DIR}/chain_${JOB_TAG}_$(date '+%Y%m%d_%H%M%S').log"
 
 log_msg() {
     local msg="$1"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$timestamp]  $msg" | tee -a "$CHAIN_LOG"
-# you can also run the launcher itself in the background from the shell,
-# e.g.:
-#    nohup ./launch.sh --name foo > launcher.out 2>&1 &
-# the script already logs everything to $CHAIN_LOG, so the terminal is not
-# needed once it is detached.
 }
 
 log_iter() {
     local iter="$1"
     local msg="$2"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     echo "[$timestamp]  [ITER-$iter]  $msg" | tee -a "$CHAIN_LOG"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         START MAIN CHAIN
-# ──────────────────────────────────────────────────────────────────────────────
+# Parse elapsed strings from squeue %M into seconds.
+# Supports D-HH:MM:SS, HH:MM:SS, and MM:SS.
+elapsed_to_seconds() {
+    local elapsed="$1"
+    local days=0
+    local hours=0
+    local mins=0
+    local secs=0
 
-log_msg "═════════════════════════════════════════════════════════════"
+    if [[ "$elapsed" =~ ^([0-9]+)-([0-9]{1,2}):([0-9]{2}):([0-9]{2})$ ]]; then
+        days="${BASH_REMATCH[1]}"
+        hours="${BASH_REMATCH[2]}"
+        mins="${BASH_REMATCH[3]}"
+        secs="${BASH_REMATCH[4]}"
+    elif [[ "$elapsed" =~ ^([0-9]{1,2}):([0-9]{2}):([0-9]{2})$ ]]; then
+        hours="${BASH_REMATCH[1]}"
+        mins="${BASH_REMATCH[2]}"
+        secs="${BASH_REMATCH[3]}"
+    elif [[ "$elapsed" =~ ^([0-9]+):([0-9]{2})$ ]]; then
+        mins="${BASH_REMATCH[1]}"
+        secs="${BASH_REMATCH[2]}"
+    else
+        echo 0
+        return
+    fi
+
+    echo $((days * 86400 + hours * 3600 + mins * 60 + secs))
+}
+
+# Returns STATE|ELAPSED where ELAPSED is from squeue %M.
+# If the job is absent from queue, returns MISSING|00:00:00.
+get_queue_state_elapsed() {
+    local job_id="$1"
+    local line
+    line="$(squeue -h -j "$job_id" -o "%T|%M" 2>/dev/null | head -1 || true)"
+
+    if [[ -z "$line" ]]; then
+        printf 'MISSING|00:00:00\n'
+        return
+    fi
+
+    printf '%s\n' "$line"
+}
+
+log_msg "=============================================================="
 log_msg "VASP Chain Automation Started"
-log_msg "Base directory:    $BASE_DIR"
-log_msg "Iterations:        $CONTINUE_FROM → $MAX_ITER"
+log_msg "Script dir:        $SCRIPT_DIR"
+log_msg "Work dir:          $WORK_DIR"
+log_msg "Log file:          $CHAIN_LOG"
+log_msg "Submit script:     $SUBMIT_SCRIPT"
+log_msg "Iterations:        $CONTINUE_FROM -> $MAX_ITER"
 log_msg "Job name prefix:   $JOB_PREFIX"
+if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
+    log_msg "VASP executable:  $VASP_EXE_OVERRIDE (override)"
+else
+    log_msg "VASP executable:  submit.sh default/env"
+fi
 if [[ -n "$SUCCESS_STRING" ]]; then
     log_msg "Success string:    '$SUCCESS_STRING'"
 else
-    log_msg "Success criteria:  Successful job completion"
+    log_msg "Success criteria:  non-empty CONTCAR after job completion"
 fi
-log_msg "Monitor interval:  $MONITOR_INTERVAL seconds (${MONITOR_INTERVAL}s ≈ $((MONITOR_INTERVAL/60)) min)"
-log_msg "═════════════════════════════════════════════════════════════"
+log_msg "Monitor interval:  $MONITOR_INTERVAL seconds"
+log_msg "=============================================================="
 
+iter="$CONTINUE_FROM"
 
-
-iter=$CONTINUE_FROM
-
-while [[ $iter -le $MAX_ITER ]]; do
-    log_iter "$iter" "────────────────────────────────────────────────"
+while [[ "$iter" -le "$MAX_ITER" ]]; do
+    log_iter "$iter" "--------------------------------------------------"
     log_iter "$iter" "Preparing iteration $iter of $MAX_ITER"
 
-    ITER_DIR="${BASE_DIR}/iteration-${iter}"
-    if [[ $DIVERGENCE_RETRY -eq 1 ]]; then
-        ITER_DIR="${BASE_DIR}/iteration-${iter}-retry"
-        log_iter "$iter" "Using retry folder for divergence recovery"
-    fi
+    ITER_DIR="${WORK_DIR}/iteration-${iter}"
+    mkdir -p "$ITER_DIR"
 
-    # ensure the iteration directory exists (previous version omitted mkdir -p)
-    if [[ ! -d "$ITER_DIR" ]]; then
-        mkdir -p "$ITER_DIR"
-        log_iter "$iter" "Created iteration directory: $ITER_DIR"
-    fi
-
-    # Select INCAR source (start for first, cont for rest)
-    if [[ $iter -eq 1 ]]; then
+    if [[ "$iter" -eq 1 ]]; then
         INCAR_SRC="INCAR.start"
     else
         INCAR_SRC="INCAR.cont"
     fi
 
-    [[ -f "$INCAR_SRC" ]] || { log_iter "$iter" "ERROR: Missing $INCAR_SRC"; exit 1; }
+    cp -f "$WORK_DIR/$INCAR_SRC" "$ITER_DIR/INCAR"
+    cp -f "$WORK_DIR/POSCAR" "$ITER_DIR/POSCAR"
+    cp -f "$WORK_DIR/KPOINTS" "$ITER_DIR/KPOINTS"
+    cp -f "$WORK_DIR/POTCAR" "$ITER_DIR/POTCAR"
+    rm -f "$ITER_DIR/STOPCAR" "$ITER_DIR/LABORT"
 
-    # Copy input files to iteration folder
-    for src in "$INCAR_SRC" POSCAR KPOINTS POTCAR; do
-        if [[ "$src" == "INCAR.start" || "$src" == "INCAR.cont" ]]; then
-            cp -f "$src" "${ITER_DIR}/INCAR" || { log_iter "$iter" "ERROR: Failed to copy $src"; exit 1; }
-        else
-            cp -f "$src" "${ITER_DIR}/" || { log_iter "$iter" "ERROR: Failed to copy $src"; exit 1; }
+    for restart_file in WAVECAR CHGCAR; do
+        if [[ -f "$WORK_DIR/$restart_file" ]]; then
+            cp -f "$WORK_DIR/$restart_file" "$ITER_DIR/"
+            log_iter "$iter" "Copied $restart_file for restart"
         fi
     done
 
-    log_iter "$iter" "Copied input files (INCAR, POSCAR, KPOINTS, POTCAR)"
-
-    # Copy restart files from base if they exist from previous iteration
-    if [[ $DIVERGENCE_RETRY -eq 1 ]]; then
-        ORIGINAL_ITER_DIR="${BASE_DIR}/iteration-${iter}"
-        # For retry, copy restart files from the original failed iteration if available
-        for restart_file in WAVECAR CHGCAR; do
-            if [[ -f "${ORIGINAL_ITER_DIR}/${restart_file}" ]]; then
-                cp -f "${ORIGINAL_ITER_DIR}/${restart_file}" "${ITER_DIR}/"
-                log_iter "$iter" "Copied $restart_file from failed iteration for retry"
-            elif [[ -f "${BASE_DIR}/${restart_file}" ]]; then
-                cp -f "${BASE_DIR}/${restart_file}" "${ITER_DIR}/"
-                log_iter "$iter" "Copied $restart_file from base for retry"
-            fi
-        done
-    else
-        # Normal copying from base
-        for restart_file in WAVECAR CHGCAR; do
-            if [[ -f "${BASE_DIR}/${restart_file}" ]]; then
-                cp -f "${BASE_DIR}/${restart_file}" "${ITER_DIR}/"
-                log_iter "$iter" "Copied $restart_file for restart"
-            fi
-        done
-    fi
-
-    # ──────────────────────────────
-    #   Submit job to SLURM
-    # ──────────────────────────────
     log_iter "$iter" "Submitting job to SLURM"
 
     JOB_NAME="${JOB_PREFIX}-iter-${iter}"
     JOB_OUTPUT="${ITER_DIR}/job.%J.out"
     JOB_ERROR="${ITER_DIR}/job.%J.err"
 
-    JOB_ID=$(sbatch \
-        --chdir="${ITER_DIR}" \
-        --job-name="$JOB_NAME" \
-        --output="$JOB_OUTPUT" \
-        --error="$JOB_ERROR" \
-        --parsable \
-        "$SUBMIT_SCRIPT" 2>&1 || echo "")
+    SBATCH_ARGS=(
+        --chdir="$ITER_DIR"
+        --job-name="$JOB_NAME"
+        --output="$JOB_OUTPUT"
+        --error="$JOB_ERROR"
+        --parsable
+    )
 
-    if [[ -z "$JOB_ID" ]]; then
-        log_iter "$iter" "ERROR: sbatch failed"
+    if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
+        SBATCH_ARGS+=(--export="ALL,VASP_EXE=$VASP_EXE_OVERRIDE")
+    fi
+
+    JOB_ID="$(sbatch "${SBATCH_ARGS[@]}" "$SUBMIT_SCRIPT" || true)"
+
+    JOB_ID="${JOB_ID%%;*}"
+
+    if [[ -z "$JOB_ID" || ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
+        log_iter "$iter" "ERROR: sbatch failed (job id: '$JOB_ID')"
         exit 1
     fi
 
-    log_iter "$iter" "Submitted → Job ID: $JOB_ID"
+    log_iter "$iter" "Submitted job ID: $JOB_ID"
 
-    # ──────────────────────────────
-    #   Monitor job with STOPCAR/LABORT handling
-    # ──────────────────────────────
     STOPCAR_WRITTEN=0
     LABORT_WRITTEN=0
     LOOP_COUNT=0
+    MISSING_STATUS_COUNT=0
+    STATE="PENDING"
 
-    log_iter "$iter" "Starting job monitoring"
+    log_iter "$iter" "Starting job monitoring (squeue)"
 
     while true; do
         LOOP_COUNT=$((LOOP_COUNT + 1))
 
-        # Get job status via sacct
-        STATE=$(sacct -n -X -o State -j "$JOB_ID" 2>/dev/null | head -1 || echo "UNKNOWN")
-
-        # Get elapsed time (only valid if job is running)
-        ELAPSED=$(sacct -n -X -o Elapsed -j "$JOB_ID" 2>/dev/null | head -1 || echo "00:00:00")
-
-        # Convert elapsed time to seconds for comparison
-        ELAPSED_SEC=$(echo "$ELAPSED" | awk -F: '{print $1*3600 + $2*60 + $3}')
+        JOB_META="$(get_queue_state_elapsed "$JOB_ID")"
+        STATE="${JOB_META%%|*}"
+        ELAPSED="${JOB_META#*|}"
+        ELAPSED_SEC="$(elapsed_to_seconds "$ELAPSED")"
 
         log_iter "$iter" "[Check $LOOP_COUNT] Status: $STATE | Elapsed: $ELAPSED ($ELAPSED_SEC s)"
 
-        # ──────────────────────────
-        #   Handle STOPCAR at 22 hours
-        # ──────────────────────────
-        if [[ "$STATE" == "RUNNING" ]] && [[ $STOPCAR_WRITTEN -eq 0 ]] && [[ $ELAPSED_SEC -ge $STOPCAR_TIME ]]; then
-            if echo "LSTOP = .TRUE." > "${ITER_DIR}/STOPCAR"; then
-                log_iter "$iter" "✓ Written STOPCAR (LSTOP = .TRUE.) at $ELAPSED"
+        if [[ "$STATE" == "MISSING" ]]; then
+            MISSING_STATUS_COUNT=$((MISSING_STATUS_COUNT + 1))
+            if [[ "$MISSING_STATUS_COUNT" -ge 2 ]]; then
+                log_iter "$iter" "Job left queue; assuming it finished"
+                STATE="FINISHED"
+                break
+            fi
+            sleep "$MONITOR_INTERVAL"
+            continue
+        fi
+
+        MISSING_STATUS_COUNT=0
+
+        if [[ "$STATE" == "RUNNING" && "$STOPCAR_WRITTEN" -eq 0 && "$ELAPSED_SEC" -ge "$STOPCAR_TIME" ]]; then
+            if echo "LSTOP = .TRUE." > "$ITER_DIR/STOPCAR"; then
+                log_iter "$iter" "Wrote STOPCAR at elapsed $ELAPSED"
                 STOPCAR_WRITTEN=1
             else
-                log_iter "$iter" "⚠ WARNING: Failed to write STOPCAR"
+                log_iter "$iter" "WARNING: failed to write STOPCAR"
             fi
         fi
 
-        # ──────────────────────────
-        #   Handle LABORT at 23 hours
-        # ──────────────────────────
-        if [[ "$STATE" == "RUNNING" ]] && [[ $LABORT_WRITTEN -eq 0 ]] && [[ $ELAPSED_SEC -ge $LABORT_TIME ]]; then
-            if echo "LABORT = .TRUE." >> "${ITER_DIR}/STOPCAR" 2>/dev/null; then
-                log_iter "$iter" "✓ Written LABORT (LABORT = .TRUE.) appended at $ELAPSED"
-            elif echo "LABORT = .TRUE." > "${ITER_DIR}/STOPCAR"; then
-                log_iter "$iter" "✓ Written LABORT to STOPCAR at $ELAPSED"
+        if [[ "$STATE" == "RUNNING" && "$LABORT_WRITTEN" -eq 0 && "$ELAPSED_SEC" -ge "$LABORT_TIME" ]]; then
+            if echo "LABORT = .TRUE." >> "$ITER_DIR/STOPCAR" 2>/dev/null; then
+                log_iter "$iter" "Wrote LABORT at elapsed $ELAPSED"
+            elif echo "LABORT = .TRUE." > "$ITER_DIR/STOPCAR"; then
+                log_iter "$iter" "Wrote LABORT to STOPCAR at elapsed $ELAPSED"
             else
-                log_iter "$iter" "⚠ WARNING: Failed to write LABORT"
+                log_iter "$iter" "WARNING: failed to write LABORT"
             fi
             LABORT_WRITTEN=1
         fi
 
-        # ──────────────────────────
-        #   Check if job finished
-        # ──────────────────────────
-        if [[ "$STATE" == "COMPLETED" || "$STATE" == "FAILED" || "$STATE" == "CANCELLED" || "$STATE" == "TIMEOUT" ]]; then
-            log_iter "$iter" "Job finished → State: $STATE"
-            break
-        fi
+        case "$STATE" in
+            CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
+                log_iter "$iter" "Job entered terminal failure state: $STATE"
+                break
+                ;;
+        esac
 
-        # Sleep before next check
         sleep "$MONITOR_INTERVAL"
     done
 
-    # ──────────────────────────────
-    #   Post-job: Check success and convergence
-    # ──────────────────────────────
-    if [[ "$STATE" == "COMPLETED" ]]; then
-        log_iter "$iter" "Job completed. Checking convergence..."
-
-        SUCCESS=0
-        DIVERGENCE_DETECTED=0
-
-        # Check for divergence in OUTCAR (increasing energy or forces)
-        if [[ -f "${ITER_DIR}/OUTCAR" ]]; then
-            # Check if energy is increasing in recent steps (simple check)
-            LAST_ENERGIES=$(grep "total energy" "${ITER_DIR}/OUTCAR" | tail -3 | awk '{print $5}')
-            if [[ $(echo "$LAST_ENERGIES" | wc -l) -eq 3 ]]; then
-                # Check if the last energy is higher than the first of the last 3
-                FIRST_ENERGY=$(echo "$LAST_ENERGIES" | head -1)
-                LAST_ENERGY=$(echo "$LAST_ENERGIES" | tail -1)
-                ENERGY_INCREASE=$(awk -v first="$FIRST_ENERGY" -v last="$LAST_ENERGY" 'BEGIN {if (last > first) print 1; else print 0}')
-                if [[ "$ENERGY_INCREASE" -eq 1 ]]; then
-                    log_iter "$iter" "⚠ WARNING: Energy divergence detected (energy increasing from $FIRST_ENERGY to $LAST_ENERGY)"
-                    DIVERGENCE_DETECTED=1
-                fi
-            fi
-
-            # Check for very high forces indicating convergence issues
-            TOTAL_FORCE=$(grep "total force" "${ITER_DIR}/OUTCAR" | tail -1 | awk '{print $4}')
-            if [[ -n "$TOTAL_FORCE" ]]; then
-                # Use awk for comparison
-                HIGH_FORCE=$(awk -v force="$TOTAL_FORCE" 'BEGIN {if (force > 1.0) print 1; else print 0}')
-                if [[ "$HIGH_FORCE" -eq 1 ]]; then
-                    log_iter "$iter" "⚠ WARNING: High total force ($TOTAL_FORCE) - possible convergence issues"
-                fi
-            fi
-        fi
-
-        # Check success criteria
-        if [[ -n "$SUCCESS_STRING" ]]; then
-            # Success string provided - check for it
-            if grep -q "$SUCCESS_STRING" "${ITER_DIR}/OUTCAR" 2>/dev/null; then
-                log_iter "$iter" "✓ SUCCESS: Found '$SUCCESS_STRING' in OUTCAR"
-                SUCCESS=1
-            else
-                log_iter "$iter" "✗ ERROR: Success string '$SUCCESS_STRING' not found in OUTCAR"
-                SUCCESS=0
-            fi
-        else
-            # No success string - successful completion is considered success
-            log_iter "$iter" "✓ SUCCESS: Job completed successfully"
-            SUCCESS=1
-        fi
-
-        # Handle divergence: allow one retry
-        if [[ $SUCCESS -eq 0 && $DIVERGENCE_DETECTED -eq 1 && $DIVERGENCE_RETRY -eq 0 ]]; then
-            log_iter "$iter" "Divergence detected - allowing one retry iteration"
-            DIVERGENCE_RETRY=1
-            # Don't advance iteration, will retry same one
-            continue
-        elif [[ $DIVERGENCE_DETECTED -eq 1 && $DIVERGENCE_RETRY -eq 1 ]]; then
-            log_iter "$iter" "✗ ERROR: Divergence persists after retry - stopping chain"
+    case "$STATE" in
+        CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
+            log_iter "$iter" "ERROR: iteration failed in queue state $STATE"
             exit 1
-        fi
+            ;;
+    esac
 
-        if [[ $SUCCESS -eq 1 ]]; then
-            # Copy CONTCAR to POSCAR for next iteration
-            if [[ -f "${ITER_DIR}/CONTCAR" && -s "${ITER_DIR}/CONTCAR" ]]; then
-                cp -f "${ITER_DIR}/CONTCAR" "${BASE_DIR}/POSCAR"
-                log_iter "$iter" "✓ Copied CONTCAR → base POSCAR"
-
-                # Copy restart files back to base for next iteration
-                for restart_file in WAVECAR CHGCAR; do
-                    if [[ -f "${ITER_DIR}/${restart_file}" ]]; then
-                        cp -f "${ITER_DIR}/${restart_file}" "${BASE_DIR}/"
-                        log_iter "$iter" "✓ Copied $restart_file to base"
-                    fi
-                done
-
-                next=$((iter + 1))
-                log_iter "$iter" "Advancing to iteration $next"
-                iter=$next
-                DIVERGENCE_RETRY=0
-
-            else
-                log_iter "$iter" "✗ ERROR: CONTCAR missing or empty in iteration folder"
-                log_iter "$iter" "Stopping chain - check job output in $ITER_DIR"
-                exit 1
-            fi
-        else
-            log_iter "$iter" "✗ ERROR: Convergence criteria not met"
-            log_iter "$iter" "Check ${ITER_DIR}/OUTCAR or job.*.out for details"
-            log_iter "$iter" "Stopping chain"
-            exit 1
-        fi
-
-    else
-        # Job did not complete successfully
-        log_iter "$iter" "✗ ERROR: Job did not complete (state: $STATE)"
-        log_iter "$iter" "Check output in ${ITER_DIR}/"
-        log_iter "$iter" "Stopping chain"
+    if [[ ! -f "$ITER_DIR/OUTCAR" ]]; then
+        log_iter "$iter" "ERROR: OUTCAR missing after job completion"
         exit 1
     fi
 
+    SUCCESS=0
+    if [[ -n "$SUCCESS_STRING" ]]; then
+        if grep -qF "$SUCCESS_STRING" "$ITER_DIR/OUTCAR" 2>/dev/null; then
+            log_iter "$iter" "SUCCESS: found success string in OUTCAR"
+            SUCCESS=1
+        else
+            log_iter "$iter" "ERROR: success string not found in OUTCAR"
+            SUCCESS=0
+        fi
+    else
+        if [[ -s "$ITER_DIR/CONTCAR" ]]; then
+            log_iter "$iter" "SUCCESS: CONTCAR is present and non-empty"
+            SUCCESS=1
+        else
+            log_iter "$iter" "ERROR: CONTCAR missing or empty"
+            SUCCESS=0
+        fi
+    fi
+
+    if [[ "$SUCCESS" -ne 1 ]]; then
+        log_iter "$iter" "Stopping chain at iteration $iter"
+        exit 1
+    fi
+
+    if [[ -s "$ITER_DIR/CONTCAR" ]]; then
+        cp -f "$ITER_DIR/CONTCAR" "$WORK_DIR/POSCAR"
+        log_iter "$iter" "Copied CONTCAR to $WORK_DIR/POSCAR"
+    else
+        log_iter "$iter" "ERROR: CONTCAR missing or empty"
+        exit 1
+    fi
+
+    for restart_file in WAVECAR CHGCAR; do
+        if [[ -f "$ITER_DIR/$restart_file" ]]; then
+            cp -f "$ITER_DIR/$restart_file" "$WORK_DIR/"
+            log_iter "$iter" "Copied $restart_file back to work dir"
+        fi
+    done
+
+    iter=$((iter + 1))
+    log_iter "$((iter - 1))" "Advancing to iteration $iter"
 done
 
-# ──────────────────────────────────────────────────────────────────────────────
-#                         COMPLETION
-# ──────────────────────────────────────────────────────────────────────────────
-
-log_msg "═════════════════════════════════════════════════════════════"
-log_msg "✓ Chain automation completed successfully"
+log_msg "=============================================================="
+log_msg "Chain automation completed successfully"
 log_msg "Final iteration: $((iter - 1)) / $MAX_ITER"
-log_msg "Log file: $CHAIN_LOG"
-log_msg "═════════════════════════════════════════════════════════════"
+log_msg "=============================================================="

@@ -1,16 +1,56 @@
 #!/bin/bash
 ################################################################################
-# setup-check.sh - Verify VASP automation setup
+# setup-check.sh - Verify AutoSlurm configuration
 #
-# Checks for required files, SLURM configuration, and provides diagnostics.
-# Usage: ./setup-check.sh [--fix]
+# Validates:
+# - required scripts and VASP input files
+# - submit script SBATCH directives
+# - launch.sh validation mode
+#
+# Usage:
+#   ./setup-check.sh [--workdir PATH] [--submit-script PATH] [--fix]
 ################################################################################
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="$(pwd)"
+SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
 FIX_MODE=0
-if [[ "${1:-}" == "--fix" ]]; then
-    FIX_MODE=1
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workdir)
+            WORK_DIR="$2"
+            shift 2
+            ;;
+        --submit-script)
+            SUBMIT_SCRIPT="$2"
+            shift 2
+            ;;
+        --fix)
+            FIX_MODE=1
+            shift
+            ;;
+        -h|--help)
+            echo "Usage: $0 [--workdir PATH] [--submit-script PATH] [--fix]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ ! -d "$WORK_DIR" ]]; then
+    echo "Error: workdir does not exist: $WORK_DIR"
+    exit 1
+fi
+WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+if [[ "$SUBMIT_SCRIPT" != /* ]]; then
+    SUBMIT_SCRIPT="${SCRIPT_DIR}/${SUBMIT_SCRIPT}"
 fi
 
 RED='\033[0;31m'
@@ -35,56 +75,68 @@ check_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
 
-print_sep() {
+sep() {
     echo "------------------------------------------------------------------"
 }
 
-print_sep
-echo "   VASP Automation Setup Checker"
-print_sep
+sep
+echo "   AutoSlurm Setup Checker"
+sep
+echo ""
+check_info "Script dir: $SCRIPT_DIR"
+check_info "Work dir:   $WORK_DIR"
+check_info "Submit:     $SUBMIT_SCRIPT"
 echo ""
 
-# ------------------------------------------------------------------
-# Check Required Files
-# ------------------------------------------------------------------
-
-echo "Checking required files..."
 MISSING_COUNT=0
 
-required_files=("launch.sh" "submit.sh" "INCAR.start" "INCAR.cont" "KPOINTS" "POSCAR" "POTCAR")
+echo "Checking required scripts..."
+if [[ -f "$SCRIPT_DIR/launch.sh" ]]; then
+    check_pass "Found: launch.sh"
+else
+    check_fail "Missing: $SCRIPT_DIR/launch.sh"
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+fi
 
-for file in "${required_files[@]}"; do
-    if [[ -f "$file" ]]; then
+if [[ -f "$SUBMIT_SCRIPT" ]]; then
+    check_pass "Found: submit.sh"
+else
+    check_fail "Missing: $SUBMIT_SCRIPT"
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+fi
+
+echo ""
+
+echo "Checking required VASP input files in workdir..."
+for file in INCAR.start INCAR.cont KPOINTS POSCAR POTCAR; do
+    if [[ -f "$WORK_DIR/$file" ]]; then
         check_pass "Found: $file"
     else
-        check_fail "Missing: $file"
+        check_fail "Missing: $WORK_DIR/$file"
         MISSING_COUNT=$((MISSING_COUNT + 1))
     fi
 done
 
 echo ""
 
-# ------------------------------------------------------------------
-# Check Script Permissions and Line Endings
-# ------------------------------------------------------------------
-
 echo "Checking script permissions..."
-for script in launch.sh submit.sh; do
+for script in "$SCRIPT_DIR/launch.sh" "$SUBMIT_SCRIPT"; do
     if [[ -f "$script" ]]; then
         if [[ -x "$script" ]]; then
-            check_pass "$script is executable"
+            check_pass "$(basename "$script") is executable"
         else
-            check_warn "$script is not executable (should be)"
-            if [[ $FIX_MODE -eq 1 ]]; then
+            check_warn "$(basename "$script") is not executable"
+            if [[ "$FIX_MODE" -eq 1 ]]; then
                 chmod +x "$script"
-                check_pass "Fixed: made $script executable"
+                check_pass "Fixed: made $(basename "$script") executable"
             fi
         fi
 
         if grep -q $'\r' "$script"; then
-            check_warn "$script contains CRLF line endings"
-            if [[ $FIX_MODE -eq 1 ]]; then
-                sed -i 's/\r$//' "$script" && check_pass "Fixed: converted $script to LF"
+            check_warn "$(basename "$script") has CRLF line endings"
+            if [[ "$FIX_MODE" -eq 1 ]]; then
+                sed -i 's/\r$//' "$script"
+                check_pass "Fixed: converted $(basename "$script") to LF"
             fi
         fi
     fi
@@ -92,207 +144,128 @@ done
 
 echo ""
 
-# ------------------------------------------------------------------
-# Check launch.sh Configuration
-# ------------------------------------------------------------------
-
-echo "Checking launch.sh configuration..."
-
-if grep -q "STOPCAR_TIME=79200" launch.sh; then
-    check_pass "STOPCAR time set to 22 hours (79200s)"
+echo "Checking launch.sh timing values..."
+if grep -q "STOPCAR_TIME=79200" "$SCRIPT_DIR/launch.sh"; then
+    check_pass "STOPCAR_TIME is 79200 (22h)"
 else
     check_warn "STOPCAR_TIME not found or modified"
 fi
 
-if grep -q "LABORT_TIME=82800" launch.sh; then
-    check_pass "LABORT time set to 23 hours (82800s)"
+if grep -q "LABORT_TIME=82800" "$SCRIPT_DIR/launch.sh"; then
+    check_pass "LABORT_TIME is 82800 (23h)"
 else
     check_warn "LABORT_TIME not found or modified"
 fi
 
-if grep -q "MONITOR_INTERVAL=" launch.sh; then
-    INTERVAL=$(grep "MONITOR_INTERVAL=" launch.sh | head -1 | cut -d'=' -f2 | sed 's/[[:space:]]*#.*//')
-    check_info "Monitoring interval set to: $INTERVAL seconds"
+if grep -q "MONITOR_INTERVAL=" "$SCRIPT_DIR/launch.sh"; then
+    INTERVAL=$(grep "MONITOR_INTERVAL=" "$SCRIPT_DIR/launch.sh" | head -1 | cut -d'=' -f2 | sed 's/[[:space:]]*#.*//')
+    check_info "Default monitor interval: $INTERVAL seconds"
 fi
 
 echo ""
 
-# ------------------------------------------------------------------
-# Check submit.sh SLURM Configuration
-# ------------------------------------------------------------------
+echo "Checking submit.sh SBATCH configuration..."
 
-echo "Checking submit.sh SLURM configuration..."
+if [[ -f "$SUBMIT_SCRIPT" ]]; then
+    effective_sbatch_line=$(awk '/^[[:space:]]*#SBATCH[[:space:]]/ {print NR; exit}' "$SUBMIT_SCRIPT")
+    effective_code_line=$(awk '/^[[:space:]]*$/ {next} /^[[:space:]]*#/ {next} {print NR; exit}' "$SUBMIT_SCRIPT")
 
-effective_sbatch_line=$(awk '/^[[:space:]]*#SBATCH[[:space:]]/ {print NR; exit}' submit.sh)
-effective_code_line=$(awk '/^[[:space:]]*$/ {next} /^[[:space:]]*#/ {next} {print NR; exit}' submit.sh)
-
-if [[ -z "$effective_sbatch_line" ]]; then
-    check_fail "No #SBATCH directives found in submit.sh"
-elif [[ -n "$effective_code_line" && "$effective_code_line" -lt "$effective_sbatch_line" ]]; then
-    check_fail "Executable content appears before #SBATCH directives; SLURM will ignore SBATCH settings"
-else
-    check_pass "SBATCH directives appear before executable shell code"
-fi
-
-extract_value() {
-    local line="$1"
-    line="$(echo "$line" | sed 's/[[:space:]]#.*$//')"
-    if [[ "$line" == *"="* ]]; then
-        echo "$line" | awk -F'=' '{print $NF}' | tr -d ' '
+    if [[ -z "$effective_sbatch_line" ]]; then
+        check_fail "No #SBATCH directives found"
+    elif [[ -n "$effective_code_line" && "$effective_code_line" -lt "$effective_sbatch_line" ]]; then
+        check_fail "Executable content appears before #SBATCH directives"
     else
-        echo "$line" | awk '{print $NF}'
+        check_pass "SBATCH directives are before executable shell code"
     fi
-}
 
-if line=$(grep "#SBATCH -N" submit.sh | head -1); then
-    NODES=$(extract_value "$line")
-    check_info "Number of nodes: $NODES"
-    if ! [[ "$NODES" =~ ^[0-9]+$ ]]; then
-        check_warn "Nodes value '$NODES' looks non-numeric (check SBATCH -N directive)"
-    fi
-fi
-
-if line=$(grep "#SBATCH --ntasks-per-node" submit.sh | head -1); then
-    TASKS=$(extract_value "$line")
-    check_info "Tasks per node: $TASKS"
-    if ! [[ "$TASKS" =~ ^[0-9]+$ ]]; then
-        check_warn "Tasks-per-node value '$TASKS' looks non-numeric (check SBATCH directive)"
-    fi
-fi
-
-if line=$(grep "#SBATCH --time" submit.sh | head -1); then
-    TIME=$(extract_value "$line")
-    check_info "Walltime limit: $TIME"
-    if [[ "$TIME" == "24:00:00" ]]; then
-        check_pass "Walltime is 24 hours (correct for STOPCAR at 22h)"
-    else
-        check_warn "Walltime is $TIME (should be at least 24:00:00)"
-    fi
-fi
-
-if line=$(grep "#SBATCH --partition" submit.sh | head -1); then
-    PARTITION=$(extract_value "$line")
-    check_warn "Partition set to: $PARTITION (verify this matches your cluster)"
-    if [[ "${PARTITION,,}" == *gpu* ]]; then
-        check_warn "Partition name contains 'gpu' - this may queue on GPU nodes"
-    fi
-fi
-
-if grep -qi "gres.*gpu" submit.sh; then
-    check_warn "submit.sh appears to request GPUs (check SBATCH directives)"
-fi
-
-echo ""
-
-# ------------------------------------------------------------------
-# Check INCAR Files
-# ------------------------------------------------------------------
-
-echo "Checking INCAR files..."
-
-if [[ -f "INCAR.start" ]]; then
-    LINES=$(wc -l < INCAR.start)
-    check_info "INCAR.start: $LINES lines"
-    if grep -q "ISTART" INCAR.start; then
-        ISTART=$(grep "ISTART" INCAR.start | head -1)
-        check_info "  First iteration: $ISTART"
-    else
-        check_warn "  ISTART not set (may need to be 0 for fresh start)"
-    fi
-fi
-
-if [[ -f "INCAR.cont" ]]; then
-    LINES=$(wc -l < INCAR.cont)
-    check_info "INCAR.cont: $LINES lines"
-    if grep -q "ISTART" INCAR.cont; then
-        ISTART=$(grep "ISTART" INCAR.cont | head -1)
-        check_info "  Continuation: $ISTART"
-        if ! grep -q "ISTART = 1" INCAR.cont; then
-            check_warn "  ISTART should typically be 1 for continuing from WAVECAR"
+    extract_value() {
+        local line="$1"
+        line="$(echo "$line" | sed 's/[[:space:]]#.*$//')"
+        if [[ "$line" == *"="* ]]; then
+            echo "$line" | awk -F'=' '{print $NF}' | tr -d ' '
+        else
+            echo "$line" | awk '{print $NF}'
         fi
-    else
-        check_warn "  ISTART not set (should be 1 to read WAVECAR)"
+    }
+
+    if line=$(grep "#SBATCH -N" "$SUBMIT_SCRIPT" | head -1); then
+        NODES=$(extract_value "$line")
+        check_info "Nodes: $NODES"
+    fi
+
+    if line=$(grep "#SBATCH --ntasks-per-node" "$SUBMIT_SCRIPT" | head -1); then
+        TASKS=$(extract_value "$line")
+        check_info "Tasks per node: $TASKS"
+    fi
+
+    if line=$(grep "#SBATCH --time" "$SUBMIT_SCRIPT" | head -1); then
+        TIME=$(extract_value "$line")
+        check_info "Walltime: $TIME"
+        if [[ "$TIME" == "24:00:00" ]]; then
+            check_pass "Walltime is 24h"
+        else
+            check_warn "Walltime is $TIME (24h recommended)"
+        fi
+    fi
+
+    if line=$(grep "#SBATCH --partition" "$SUBMIT_SCRIPT" | head -1); then
+        PARTITION=$(extract_value "$line")
+        check_info "Partition: $PARTITION"
+        if [[ "${PARTITION,,}" == *gpu* ]]; then
+            check_warn "Partition contains 'gpu'"
+        fi
+    fi
+
+    if grep -qi "gres.*gpu" "$SUBMIT_SCRIPT"; then
+        check_warn "submit.sh appears to request GPUs"
     fi
 fi
 
 echo ""
 
-# ------------------------------------------------------------------
-# Check VASP Input Files
-# ------------------------------------------------------------------
-
-echo "Checking VASP input files..."
-
-for file in KPOINTS POSCAR POTCAR; do
-    if [[ -f "$file" ]]; then
-        SIZE=$(du -h "$file" | cut -f1)
-        LINES=$(wc -l < "$file")
-        check_info "$file: $LINES lines, ~$SIZE"
-    fi
-done
-
-echo ""
-
-# ------------------------------------------------------------------
-# Check SLURM Availability
-# ------------------------------------------------------------------
-
-echo "Checking SLURM availability..."
-
-if command -v sbatch &> /dev/null; then
-    check_pass "sbatch command found"
+echo "Checking scheduler commands..."
+if command -v sbatch >/dev/null 2>&1; then
+    check_pass "sbatch found"
 else
-    check_fail "sbatch not found (SLURM not installed or not in PATH)"
+    check_fail "sbatch not found"
 fi
 
-if command -v sacct &> /dev/null; then
-    check_pass "sacct command found"
+if command -v squeue >/dev/null 2>&1; then
+    check_pass "squeue found"
 else
-    check_fail "sacct not found (cannot monitor jobs)"
+    check_fail "squeue not found"
 fi
 
-if command -v scontrol &> /dev/null; then
-    check_pass "scontrol command found"
+if command -v scontrol >/dev/null 2>&1; then
+    check_pass "scontrol found"
 else
-    check_fail "scontrol not found (needed for job info)"
+    check_warn "scontrol not found"
+fi
+
+if command -v sacct >/dev/null 2>&1; then
+    check_info "sacct found (optional for this workflow)"
+else
+    check_info "sacct not found (workflow uses squeue monitoring)"
 fi
 
 echo ""
 
-# ------------------------------------------------------------------
-# Test Mode Dry-Run
-# ------------------------------------------------------------------
-
-echo "Testing launch.sh dry-run (argument parsing)..."
-
-if ./launch.sh --validate-only >/dev/null 2>&1; then
-    check_pass "launch.sh validation mode works (no job submission)"
+echo "Testing launch.sh --validate-only..."
+if "$SCRIPT_DIR/launch.sh" --validate-only --workdir "$WORK_DIR" --submit-script "$SUBMIT_SCRIPT" >/dev/null 2>&1; then
+    check_pass "launch.sh validation mode works"
 else
-    check_fail "launch.sh validation mode failed (run ./launch.sh --validate-only for details)"
+    check_fail "launch.sh validation mode failed"
 fi
 
 echo ""
-
-# ------------------------------------------------------------------
-# Summary
-# ------------------------------------------------------------------
-
-print_sep
-
-if [[ $MISSING_COUNT -gt 0 ]]; then
-    echo -e "${RED}Setup incomplete: $MISSING_COUNT files missing${NC}"
-    echo ""
-    echo "To create template files, run:"
-    echo "  $0 --fix"
-    echo ""
+sep
+if [[ "$MISSING_COUNT" -gt 0 ]]; then
+    check_fail "Setup incomplete: $MISSING_COUNT missing files"
     exit 1
 else
-    check_pass "All required files present!"
+    check_pass "Setup looks good"
     echo ""
-    echo "Ready to run:"
-    echo "  ./launch.sh --name \"yourjob\" --max-iter 20 \\"
-    echo "              --success-string \"reached structural accuracy\""
-    echo ""
+    echo "Run example:"
+    echo "  $SCRIPT_DIR/launch.sh --workdir $WORK_DIR --name my-job --max-iter 5"
 fi
-
-print_sep
+sep
