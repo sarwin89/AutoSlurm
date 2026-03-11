@@ -2,6 +2,10 @@
 ################################################################################
 #   launch.sh - Automated VASP iteration chain orchestrator
 #   
+#   NOTE: this script is intended for Linux/batch systems.  If it has
+#   Windows-style CRLF line endings the kernel will complain; the script
+#   will attempt to normalise itself on the first invocation.
+#   
 #   Handles:
 #   - Creating iteration folders with proper INCAR/POSCAR/KPOINTS/POTCAR
 #   - Submitting jobs to SLURM  
@@ -19,6 +23,11 @@
 ################################################################################
 
 set -euo pipefail
+
+# convert this script to Unix line endings if accidentally checked out with CRLF
+if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
+    sed -i 's/\r$//' "${BASH_SOURCE[0]}" || true
+fi
 
 # ──────────────────────────────────────────────────────────────────────────────
 #                           DEFAULTS & SETUP
@@ -109,6 +118,11 @@ log_msg() {
     local msg="$1"
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[$timestamp]  $msg" | tee -a "$CHAIN_LOG"
+# you can also run the launcher itself in the background from the shell,
+# e.g.:
+#    nohup ./launch.sh --name foo > launcher.out 2>&1 &
+# the script already logs everything to $CHAIN_LOG, so the terminal is not
+# needed once it is detached.
 }
 
 log_iter() {
@@ -147,6 +161,12 @@ while [[ $iter -le $MAX_ITER ]]; do
     if [[ $DIVERGENCE_RETRY -eq 1 ]]; then
         ITER_DIR="${BASE_DIR}/iteration-${iter}-retry"
         log_iter "$iter" "Using retry folder for divergence recovery"
+    fi
+
+    # ensure the iteration directory exists (previous version omitted mkdir -p)
+    if [[ ! -d "$ITER_DIR" ]]; then
+        mkdir -p "$ITER_DIR"
+        log_iter "$iter" "Created iteration directory: $ITER_DIR"
     fi
 
     # Select INCAR source (start for first, cont for rest)

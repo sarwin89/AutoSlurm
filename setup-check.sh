@@ -78,17 +78,13 @@ for script in launch.sh submit.sh; do
                 check_pass "Fixed: Made $script executable"
             fi
         fi
-    fi
-done
-
-echo ""
-
-# ──────────────────────────────────────────────────────────────────────────────
-#                      Check launch.sh Configuration
-# ──────────────────────────────────────────────────────────────────────────────
-
-echo "Checking launch.sh configuration..."
-
+        # detect Windows CRLF line endings
+        if grep -q $'\r' "$script"; then
+            check_warn "$script contains CRLF line endings (run dos2unix or re-clone with LF)"
+            if [[ $FIX_MODE -eq 1 ]]; then
+                sed -i 's/\r$//' "$script" && check_pass "Fixed: converted $script to LF"
+            fi
+        fi
 if grep -q "STOPCAR_TIME=79200" launch.sh; then
     check_pass "STOPCAR time set to 22 hours (79200s)"
 else

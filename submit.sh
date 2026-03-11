@@ -9,6 +9,11 @@
 
 set -euo pipefail
 
+# normalize line endings if file was checked out with CRLF
+if grep -q $'\r' "${BASH_SOURCE[0]}" 2>/dev/null; then
+    sed -i 's/\r$//' "${BASH_SOURCE[0]}" || true
+fi
+
 # ──────────────────────────────────────────────────────────────────────────────
 #                         SBATCH CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
@@ -18,6 +23,9 @@ set -euo pipefail
 #SBATCH -N 2
 #SBATCH --ntasks-per-node=24
 #SBATCH --time=24:00:00
+#SBATCH --gres=gpu:0            # explicitly request no GPUs so the job
+#                              # cannot accidentally land on a GPU node
+#SBATCH --constraint=cpu       # cluster-dependent; ensure only CPU nodes
 #SBATCH --error=job.%J.err
 #SBATCH --output=job.%J.out
 #SBATCH --exclusive
@@ -68,8 +76,13 @@ echo "  Nodes:   $SLURM_NNODES"
 echo "  Tasks:   $SLURM_NTASKS"
 echo "  Command: $MPI_CMD $VASP_EXE"
 
-$MPI_CMD $VASP_EXE
+# capture VASP stdout/stderr in a separate log so it's easy to monitor
+# (VASP still writes OUTCAR and other files as usual)
+$MPI_CMD $VASP_EXE > vasp.log 2>&1
 VASP_EXIT=$?
+
+# vasp.log will be located in the iteration folder; you may tail it
+# if the job is running or inspect after completion.
 
 echo "$(date '+%Y-%m-%d %H:%M:%S')  VASP finished with exit code: $VASP_EXIT"
 
