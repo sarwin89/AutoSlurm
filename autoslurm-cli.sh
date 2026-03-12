@@ -12,11 +12,24 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(pwd)"
-INPUT_DIR="${WORK_DIR}/input"
+INPUT_DIR=""
 LOG_DIR="${WORK_DIR}/logs"
 
 AUTOSLURM_DEFAULT="${SCRIPT_DIR}"
 VASP_BASE_DEFAULT="/pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin"
+
+detect_input_dir() {
+    local base_dir="$1"
+    for candidate in input inputs INPUT INPUTS; do
+        if [[ -d "$base_dir/$candidate" ]]; then
+            echo "$base_dir/$candidate"
+            return
+        fi
+    done
+    echo "$base_dir/input"
+}
+
+INPUT_DIR="$(detect_input_dir "$WORK_DIR")"
 
 ask_with_default() {
     local prompt="$1"
@@ -167,6 +180,11 @@ job_name_default="$(basename "$WORK_DIR")"
 job_name="$(ask_with_default "Job name prefix" "$job_name_default")"
 continue_from="$(ask_with_default "Continue from iteration" "1")"
 max_iter="$(ask_with_default "Max iteration" "20")"
+nodes_count="$(ask_with_default "Node count" "5")"
+if ! [[ "$nodes_count" =~ ^[0-9]+$ ]] || [[ "$nodes_count" -lt 1 ]]; then
+    echo "Error: node count must be an integer >= 1"
+    exit 1
+fi
 monitor_interval="$(ask_with_default "Monitor interval (seconds)" "1800")"
 
 echo ""
@@ -206,6 +224,7 @@ launch_args=(
     --name "$job_name"
     --continue-from "$continue_from"
     --max-iter "$max_iter"
+    --nodes "$nodes_count"
     --monitor-interval "$monitor_interval"
     --vasp-exe "$vasp_exe"
 )
@@ -224,6 +243,7 @@ echo "  Mirror log dir:  $autoslurm/logs"
 echo "  VASP executable: $vasp_exe"
 echo "  Job prefix:      $job_name"
 echo "  Iterations:      $continue_from -> $max_iter"
+echo "  Nodes:           $nodes_count"
 echo "  Monitor interval:$monitor_interval"
 if [[ -n "$success_string" ]]; then
     echo "  Success string:  $success_string"

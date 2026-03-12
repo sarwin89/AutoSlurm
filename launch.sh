@@ -25,6 +25,7 @@ INPUT_DIR=""
 LOG_DIR=""
 MIRROR_LOG_DIR="${SCRIPT_DIR}/logs"
 SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
+NODES_OVERRIDE=""
 VASP_EXE_OVERRIDE=""
 VALIDATE_ONLY=0
 
@@ -33,10 +34,11 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  --workdir PATH          Job directory (default: current directory)"
-    echo "  --input-dir PATH        Input directory (default: <workdir>/input)"
+    echo "  --input-dir PATH        Input directory (default: auto-detect input/inputs/INPUT/INPUTS)"
     echo "  --log-dir PATH          Primary chain log directory (default: <workdir>/logs)"
     echo "  --mirror-log-dir PATH   Mirror chain log directory (default: <autoslurm>/logs)"
     echo "  --submit-script PATH    Submit script path (default: <autoslurm>/submit.sh)"
+    echo "  --nodes N               Override node count for this run (optional)"
     echo "  --vasp-exe PATH_OR_CMD  Override VASP executable for submit.sh (optional)"
     echo "  --continue-from N       Iteration number to start from (default: 1)"
     echo "  --max-iter N            Last iteration number (default: 20)"
@@ -67,6 +69,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --submit-script)
             SUBMIT_SCRIPT="$2"
+            shift 2
+            ;;
+        --nodes)
+            NODES_OVERRIDE="$2"
             shift 2
             ;;
         --vasp-exe)
@@ -119,6 +125,11 @@ if ! [[ "$MAX_ITER" =~ ^[0-9]+$ ]] || [[ "$MAX_ITER" -lt "$CONTINUE_FROM" ]]; th
     exit 1
 fi
 
+if [[ -n "$NODES_OVERRIDE" ]] && { ! [[ "$NODES_OVERRIDE" =~ ^[0-9]+$ ]] || [[ "$NODES_OVERRIDE" -lt 1 ]]; }; then
+    echo "Error: --nodes must be an integer >= 1"
+    exit 1
+fi
+
 if ! [[ "$MONITOR_INTERVAL" =~ ^[0-9]+$ ]] || [[ "$MONITOR_INTERVAL" -lt 60 ]]; then
     echo "Error: --monitor-interval must be an integer >= 60"
     exit 1
@@ -131,7 +142,15 @@ fi
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
 if [[ -z "$INPUT_DIR" ]]; then
-    INPUT_DIR="${WORK_DIR}/input"
+    for candidate in input inputs INPUT INPUTS; do
+        if [[ -d "$WORK_DIR/$candidate" ]]; then
+            INPUT_DIR="$WORK_DIR/$candidate"
+            break
+        fi
+    done
+    if [[ -z "$INPUT_DIR" ]]; then
+        INPUT_DIR="${WORK_DIR}/input"
+    fi
 elif [[ "$INPUT_DIR" != /* ]]; then
     INPUT_DIR="${WORK_DIR}/${INPUT_DIR}"
 fi
@@ -177,6 +196,11 @@ if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
     echo "  Log dir:          $LOG_DIR"
     echo "  Mirror log dir:   $MIRROR_LOG_DIR"
     echo "  Submit script:    $SUBMIT_SCRIPT"
+    if [[ -n "$NODES_OVERRIDE" ]]; then
+        echo "  Nodes:            $NODES_OVERRIDE (override)"
+    else
+        echo "  Nodes:            submit.sh default"
+    fi
     if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
         echo "  VASP exe:         $VASP_EXE_OVERRIDE"
     else
@@ -249,7 +273,7 @@ elapsed_to_seconds() {
         return
     fi
 
-    echo $((days * 86400 + hours * 3600 + mins * 60 + secs))
+    echo $((10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs))
 }
 
 # Returns STATE|ELAPSED where ELAPSED is from squeue %M.
@@ -309,6 +333,11 @@ fi
 log_msg "Submit script:     $SUBMIT_SCRIPT"
 log_msg "Iterations:        $CONTINUE_FROM -> $MAX_ITER"
 log_msg "Job name prefix:   $JOB_PREFIX"
+if [[ -n "$NODES_OVERRIDE" ]]; then
+    log_msg "Nodes:             $NODES_OVERRIDE (override)"
+else
+    log_msg "Nodes:             submit.sh default"
+fi
 if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
     log_msg "VASP executable:   $VASP_EXE_OVERRIDE (override)"
 else
@@ -369,6 +398,10 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         --error="$JOB_ERROR"
         --parsable
     )
+
+    if [[ -n "$NODES_OVERRIDE" ]]; then
+        SBATCH_ARGS+=(--nodes="$NODES_OVERRIDE")
+    fi
 
     if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
         SBATCH_ARGS+=(--export="ALL,VASP_EXE=$VASP_EXE_OVERRIDE")

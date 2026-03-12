@@ -66,7 +66,15 @@ fi
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
 if [[ -z "$INPUT_DIR" ]]; then
-    INPUT_DIR="${WORK_DIR}/input"
+    for candidate in input inputs INPUT INPUTS; do
+        if [[ -d "$WORK_DIR/$candidate" ]]; then
+            INPUT_DIR="$WORK_DIR/$candidate"
+            break
+        fi
+    done
+    if [[ -z "$INPUT_DIR" ]]; then
+        INPUT_DIR="${WORK_DIR}/input"
+    fi
 elif [[ "$INPUT_DIR" != /* ]]; then
     INPUT_DIR="${WORK_DIR}/${INPUT_DIR}"
 fi
