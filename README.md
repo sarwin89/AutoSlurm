@@ -1,159 +1,175 @@
 # AutoSlurm
 
-Bash-based automation for iterative VASP jobs on SLURM.
+AutoSlurm is a Bash automation toolkit for iterative VASP jobs on SLURM.
 
-This version is built for a centralized layout:
-- Keep automation scripts in one shared AutoSlurm directory.
-- Keep job inputs and iteration folders in separate work directories.
-- Monitor runtime using `squeue` (no `sacct` dependency for core flow).
+Current model:
+- scripts live in one shared AutoSlurm directory
+- each calculation uses its own work directory
+- canonical input files are in `<workdir>/input`
+- iteration folders are created directly under `<workdir>`
+- chain logs are written to `<workdir>/logs` and mirrored to `<autoslurm>/logs`
 
-## Quick Start (Centralized)
+## Main Scripts
+
+- `autoslurm-cli.sh`: interactive frontend wrapper (recommended for daily use)
+- `launch.sh`: iteration orchestrator + queue monitor (`squeue` based)
+- `submit.sh`: SLURM submit runner for VASP
+- `setup-check.sh`: setup validator
+- `reset-run.sh`: cleanup helper (full or from iteration onward)
+
+## Required Workdir Layout
+
+```text
+<workdir>/
+  input/
+    INCAR.start
+    INCAR.cont
+    KPOINTS
+    POSCAR
+    POTCAR
+  logs/
+  iteration-1/
+  iteration-2/
+  ...
+```
+
+Notes:
+- `input/POSCAR` is the initial seed.
+- runtime POSCAR is maintained at `<workdir>/POSCAR` during chain progress.
+- `WAVECAR` and `CHGCAR` are stored in `<workdir>` between iterations.
+
+## Quick Start (Interactive Wrapper)
 
 ```bash
-# 1) Paths
+AUTOSLURM=/pfs/home/shobhana/sarwin/AutoSlurm
+cd /pfs/home/shobhana/sarwin/bilayer-7/test
+
+chmod +x "$AUTOSLURM"/autoslurm-cli.sh \
+         "$AUTOSLURM"/launch.sh \
+         "$AUTOSLURM"/setup-check.sh \
+         "$AUTOSLURM"/submit.sh \
+         "$AUTOSLURM"/reset-run.sh
+
+"$AUTOSLURM"/autoslurm-cli.sh
+```
+
+Wrapper flow:
+1. uses current directory as `workdir`
+2. asks default or custom AutoSlurm + VASP locations
+3. asks VASP binary variant (`vasp_std`, `vasp_ncl`, `vasp_gam`, custom)
+4. optional reset (none, all, or from iteration N)
+5. runs `setup-check.sh`
+6. runs `launch.sh --validate-only`
+7. collects job name, iteration range, success string, monitor interval
+8. submits with `nohup` and exits while run continues in background
+
+## Non-Interactive Usage
+
+```bash
 AUTOSLURM=/pfs/home/shobhana/sarwin/AutoSlurm
 JOBDIR=/pfs/home/shobhana/sarwin/bilayer-7/test
-LOGDIR=$AUTOSLURM/logs
-VASP_EXE=/pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std
 
-# 2) Ensure scripts are executable
-chmod +x "$AUTOSLURM"/launch.sh "$AUTOSLURM"/setup-check.sh "$AUTOSLURM"/submit.sh "$AUTOSLURM"/reset-run.sh
+"$AUTOSLURM"/setup-check.sh \
+  --workdir "$JOBDIR" \
+  --input-dir "$JOBDIR/input"
 
-# 3) Validate setup
-# setup-check.sh supports --workdir and --submit-script (not --log-dir)
-"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
-
-# 4) Validate launch configuration
 "$AUTOSLURM"/launch.sh --validate-only \
   --workdir "$JOBDIR" \
-  --log-dir "$LOGDIR" \
-  --vasp-exe "$VASP_EXE"
+  --input-dir "$JOBDIR/input" \
+  --log-dir "$JOBDIR/logs" \
+  --mirror-log-dir "$AUTOSLURM/logs" \
+  --vasp-exe /pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std
 
-# 5) Optional clean restart
-"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --log-dir "$LOGDIR" --yes
-
-# 6) Run chain
 "$AUTOSLURM"/launch.sh \
   --workdir "$JOBDIR" \
-  --log-dir "$LOGDIR" \
+  --input-dir "$JOBDIR/input" \
+  --log-dir "$JOBDIR/logs" \
+  --mirror-log-dir "$AUTOSLURM/logs" \
   --name "AST-7r" \
+  --continue-from 1 \
   --max-iter 5 \
   --success-string "stopping structural energy minimisation" \
   --monitor-interval 120 \
-  --vasp-exe "$VASP_EXE"
+  --vasp-exe /pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std
 ```
 
-## Required Files
+## Reset Options
 
-Place these in `JOBDIR`:
-- `INCAR.start`
-- `INCAR.cont`
-- `KPOINTS`
-- `POSCAR`
-- `POTCAR`
-
-During execution, AutoSlurm creates:
-- `iteration-1`, `iteration-2`, ... inside `JOBDIR`
-- chain logs in `LOGDIR` as `chain_<jobtag>_<timestamp>.log`
-
-## Script Roles
-
-- `launch.sh`
-  - orchestrates iterations
-  - submits each iteration via `sbatch`
-  - monitors queue state via `squeue -h -j <jobid> -o "%T|%M"`
-  - writes STOPCAR/LABORT by elapsed runtime
-  - copies `CONTCAR -> POSCAR` and restart files for next iteration
-
-- `submit.sh`
-  - contains cluster-specific `#SBATCH` settings
-  - loads modules
-  - runs VASP through MPI
-  - validates `VASP_EXE` early and exits clearly if missing
-
-- `setup-check.sh`
-  - checks required scripts and input files
-  - checks SBATCH directives in submit script
-  - confirms launcher `--validate-only` works
-
-- `reset-run.sh`
-  - removes iteration folders and chain/job logs for a clean rerun
-  - supports external log directory via `--log-dir`
-
-## CLI Reference
-
-### launch.sh
-
+Full reset:
 ```bash
-launch.sh [options]
-
---workdir PATH          Required in centralized usage
---log-dir PATH          Chain log output directory (default: <autoslurm>/logs)
---submit-script PATH    Alternate submit script (default: <autoslurm>/submit.sh)
---vasp-exe PATH_OR_CMD  Override VASP executable passed to submit.sh
---continue-from N       Start iteration (default: 1)
---max-iter N            End iteration (default: 20)
---name PREFIX           SLURM job name prefix (default: VASP-calc)
---success-string TEXT   Required text in OUTCAR (optional)
---monitor-interval SEC  Poll interval in seconds (default: 1800)
---validate-only         Validate config and exit
+"$AUTOSLURM"/reset-run.sh \
+  --workdir "$JOBDIR" \
+  --log-dir "$JOBDIR/logs" \
+  --mirror-log-dir "$AUTOSLURM/logs" \
+  --yes
 ```
 
-### setup-check.sh
-
+Reset from iteration N onward:
 ```bash
-setup-check.sh [--workdir PATH] [--submit-script PATH] [--fix]
-```
-
-### reset-run.sh
-
-```bash
-reset-run.sh --workdir PATH [--log-dir PATH] [--yes]
+"$AUTOSLURM"/reset-run.sh \
+  --workdir "$JOBDIR" \
+  --log-dir "$JOBDIR/logs" \
+  --mirror-log-dir "$AUTOSLURM/logs" \
+  --from-iter 3 \
+  --yes
 ```
 
 ## Monitoring
 
 ```bash
-# queue state
+# queue
 squeue -j <jobid>
+squeue -h -j <jobid> -o "%T|%M|%L|%N"
 
-# live chain log
-tail -f "$LOGDIR"/chain_$(basename "$JOBDIR")_*.log
+# chain logs (primary + mirror)
+tail -f "$JOBDIR"/logs/chain_*.log
+tail -f "$AUTOSLURM"/logs/chain_$(basename "$JOBDIR")_*.log
 
-# iteration outputs
-ls -lah "$JOBDIR"/iteration-1
-tail -n 50 "$JOBDIR"/iteration-1/OUTCAR
+# current OUTCAR progress
+# launch logs now include grep-based progress markers like:
+# OUTCAR: Iteration 1( 4)
+```
+
+## Launch CLI Reference
+
+```text
+launch.sh [options]
+
+--workdir PATH
+--input-dir PATH              default: <workdir>/input
+--log-dir PATH                default: <workdir>/logs
+--mirror-log-dir PATH         default: <autoslurm>/logs
+--submit-script PATH          default: <autoslurm>/submit.sh
+--vasp-exe PATH_OR_CMD
+--continue-from N             default: 1
+--max-iter N                  default: 20
+--name PREFIX                 default: VASP-calc
+--success-string TEXT         optional
+--monitor-interval SEC        default: 1800
+--validate-only
+```
+
+## setup-check CLI Reference
+
+```text
+setup-check.sh [--workdir PATH] [--input-dir PATH] [--submit-script PATH]
+               [--log-dir PATH] [--mirror-log-dir PATH] [--fix]
 ```
 
 ## Troubleshooting
 
-### Unknown option: --log-dir (from setup-check.sh)
-Use:
-```bash
-"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
-```
-`setup-check.sh` does not accept `--log-dir`.
+### `Unknown option: --log-dir` on old setup-check
+You are using an older script version. Pull latest AutoSlurm scripts.
 
-### Job submitted but VASP fails immediately
-If `iteration-N/vasp.log` shows `execvp error ... vasp_std (No such file or directory)`, set one of:
-- `--vasp-exe /absolute/path/to/vasp_std` in `launch.sh`
-- or `export VASP_EXE=/absolute/path/to/vasp_std` before launch
+### `execvp error ... vasp_std (No such file or directory)`
+Set `--vasp-exe` to the full executable path or ensure module path exports VASP on compute nodes.
 
-### Job runs but chain log is not moving
-Check launcher process:
+### Job is running but chain log is static
+Check if launcher process still exists:
 ```bash
 pgrep -af launch.sh
 ```
-If missing, restart launch command. If present, verify `--monitor-interval` is not too large.
+Also verify monitor interval is not too high.
 
-### STOPCAR/LABORT timing
-Defaults in `launch.sh`:
-- `STOPCAR_TIME=79200` (22h)
-- `LABORT_TIME=82800` (23h)
-
-These use `squeue` elapsed runtime (`%M`) and are applied while state is `RUNNING`.
-
-## Notes
-
-- `submit-cpu.sh` can remain as a known-good local reference.
-- Main production path is now `launch.sh` + `submit.sh` + `setup-check.sh` + `reset-run.sh`.
+### CPU vs GPU partition
+`submit.sh` partition controls submission target. Keep `#SBATCH --partition=cpu` if CPU-only is desired.

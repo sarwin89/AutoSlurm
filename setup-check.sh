@@ -8,13 +8,17 @@
 # - launch.sh validation mode
 #
 # Usage:
-#   ./setup-check.sh [--workdir PATH] [--submit-script PATH] [--fix]
+#   ./setup-check.sh [--workdir PATH] [--input-dir PATH] [--submit-script PATH]
+#                    [--log-dir PATH] [--mirror-log-dir PATH] [--fix]
 ################################################################################
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(pwd)"
+INPUT_DIR=""
+LOG_DIR=""
+MIRROR_LOG_DIR="${SCRIPT_DIR}/logs"
 SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
 FIX_MODE=0
 
@@ -24,8 +28,20 @@ while [[ $# -gt 0 ]]; do
             WORK_DIR="$2"
             shift 2
             ;;
+        --input-dir)
+            INPUT_DIR="$2"
+            shift 2
+            ;;
         --submit-script)
             SUBMIT_SCRIPT="$2"
+            shift 2
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
+            shift 2
+            ;;
+        --mirror-log-dir)
+            MIRROR_LOG_DIR="$2"
             shift 2
             ;;
         --fix)
@@ -33,7 +49,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 [--workdir PATH] [--submit-script PATH] [--fix]"
+            echo "Usage: $0 [--workdir PATH] [--input-dir PATH] [--submit-script PATH] [--log-dir PATH] [--mirror-log-dir PATH] [--fix]"
             exit 0
             ;;
         *)
@@ -48,6 +64,22 @@ if [[ ! -d "$WORK_DIR" ]]; then
     exit 1
 fi
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+
+if [[ -z "$INPUT_DIR" ]]; then
+    INPUT_DIR="${WORK_DIR}/input"
+elif [[ "$INPUT_DIR" != /* ]]; then
+    INPUT_DIR="${WORK_DIR}/${INPUT_DIR}"
+fi
+
+if [[ -z "$LOG_DIR" ]]; then
+    LOG_DIR="${WORK_DIR}/logs"
+elif [[ "$LOG_DIR" != /* ]]; then
+    LOG_DIR="${WORK_DIR}/${LOG_DIR}"
+fi
+
+if [[ "$MIRROR_LOG_DIR" != /* ]]; then
+    MIRROR_LOG_DIR="${SCRIPT_DIR}/${MIRROR_LOG_DIR}"
+fi
 
 if [[ "$SUBMIT_SCRIPT" != /* ]]; then
     SUBMIT_SCRIPT="${SCRIPT_DIR}/${SUBMIT_SCRIPT}"
@@ -83,9 +115,12 @@ sep
 echo "   AutoSlurm Setup Checker"
 sep
 echo ""
-check_info "Script dir: $SCRIPT_DIR"
-check_info "Work dir:   $WORK_DIR"
-check_info "Submit:     $SUBMIT_SCRIPT"
+check_info "Script dir:      $SCRIPT_DIR"
+check_info "Work dir:        $WORK_DIR"
+check_info "Input dir:       $INPUT_DIR"
+check_info "Log dir:         $LOG_DIR"
+check_info "Mirror log dir:  $MIRROR_LOG_DIR"
+check_info "Submit script:   $SUBMIT_SCRIPT"
 echo ""
 
 MISSING_COUNT=0
@@ -105,22 +140,33 @@ else
     MISSING_COUNT=$((MISSING_COUNT + 1))
 fi
 
+if [[ -f "$SCRIPT_DIR/reset-run.sh" ]]; then
+    check_pass "Found: reset-run.sh"
+else
+    check_warn "Missing: $SCRIPT_DIR/reset-run.sh"
+fi
+
 echo ""
 
-echo "Checking required VASP input files in workdir..."
-for file in INCAR.start INCAR.cont KPOINTS POSCAR POTCAR; do
-    if [[ -f "$WORK_DIR/$file" ]]; then
-        check_pass "Found: $file"
-    else
-        check_fail "Missing: $WORK_DIR/$file"
-        MISSING_COUNT=$((MISSING_COUNT + 1))
-    fi
-done
+echo "Checking required VASP input files in input dir..."
+if [[ -d "$INPUT_DIR" ]]; then
+    for file in INCAR.start INCAR.cont KPOINTS POSCAR POTCAR; do
+        if [[ -f "$INPUT_DIR/$file" ]]; then
+            check_pass "Found: input/$file"
+        else
+            check_fail "Missing: $INPUT_DIR/$file"
+            MISSING_COUNT=$((MISSING_COUNT + 1))
+        fi
+    done
+else
+    check_fail "Input directory not found: $INPUT_DIR"
+    MISSING_COUNT=$((MISSING_COUNT + 1))
+fi
 
 echo ""
 
 echo "Checking script permissions..."
-for script in "$SCRIPT_DIR/launch.sh" "$SUBMIT_SCRIPT"; do
+for script in "$SCRIPT_DIR/launch.sh" "$SUBMIT_SCRIPT" "$SCRIPT_DIR/reset-run.sh"; do
     if [[ -f "$script" ]]; then
         if [[ -x "$script" ]]; then
             check_pass "$(basename "$script") is executable"
@@ -251,7 +297,13 @@ fi
 echo ""
 
 echo "Testing launch.sh --validate-only..."
-if "$SCRIPT_DIR/launch.sh" --validate-only --workdir "$WORK_DIR" --submit-script "$SUBMIT_SCRIPT" >/dev/null 2>&1; then
+if "$SCRIPT_DIR/launch.sh" \
+    --validate-only \
+    --workdir "$WORK_DIR" \
+    --input-dir "$INPUT_DIR" \
+    --log-dir "$LOG_DIR" \
+    --mirror-log-dir "$MIRROR_LOG_DIR" \
+    --submit-script "$SUBMIT_SCRIPT" >/dev/null 2>&1; then
     check_pass "launch.sh validation mode works"
 else
     check_fail "launch.sh validation mode failed"

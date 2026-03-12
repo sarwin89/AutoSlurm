@@ -3,12 +3,10 @@
 # launch.sh - Automated VASP iteration orchestrator (squeue-only monitoring)
 #
 # Centralized usage:
-#   Keep this script + submit.sh in one AutoSlurm folder.
-#   Keep VASP inputs in a separate work directory.
-#
-# Example:
-#   ./launch.sh --workdir /path/to/jobA --name "jobA" --max-iter 10 \
-#       --success-string "stopping structural energy minimisation"
+#   - Keep automation scripts in one AutoSlurm folder.
+#   - Keep each calculation in a separate work directory.
+#   - Store canonical inputs in <workdir>/input.
+#   - Write chain logs to <workdir>/logs and mirror to <autoslurm>/logs.
 ################################################################################
 
 set -euo pipefail
@@ -23,7 +21,9 @@ MONITOR_INTERVAL=1800
 STOPCAR_TIME=79200
 LABORT_TIME=82800
 WORK_DIR="$(pwd)"
-LOG_DIR="${SCRIPT_DIR}/logs"
+INPUT_DIR=""
+LOG_DIR=""
+MIRROR_LOG_DIR="${SCRIPT_DIR}/logs"
 SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
 VASP_EXE_OVERRIDE=""
 VALIDATE_ONLY=0
@@ -32,9 +32,11 @@ print_usage() {
     echo "Usage: $0 [options]"
     echo ""
     echo "Options:"
-    echo "  --workdir PATH          Directory containing INCAR.start/INCAR.cont/POSCAR/KPOINTS/POTCAR"
-    echo "  --log-dir PATH          Directory where chain logs are written (default: ${SCRIPT_DIR}/logs)"
-    echo "  --submit-script PATH    Submit script path (default: ${SCRIPT_DIR}/submit.sh)"
+    echo "  --workdir PATH          Job directory (default: current directory)"
+    echo "  --input-dir PATH        Input directory (default: <workdir>/input)"
+    echo "  --log-dir PATH          Primary chain log directory (default: <workdir>/logs)"
+    echo "  --mirror-log-dir PATH   Mirror chain log directory (default: <autoslurm>/logs)"
+    echo "  --submit-script PATH    Submit script path (default: <autoslurm>/submit.sh)"
     echo "  --vasp-exe PATH_OR_CMD  Override VASP executable for submit.sh (optional)"
     echo "  --continue-from N       Iteration number to start from (default: 1)"
     echo "  --max-iter N            Last iteration number (default: 20)"
@@ -51,8 +53,16 @@ while [[ $# -gt 0 ]]; do
             WORK_DIR="$2"
             shift 2
             ;;
+        --input-dir)
+            INPUT_DIR="$2"
+            shift 2
+            ;;
         --log-dir)
             LOG_DIR="$2"
+            shift 2
+            ;;
+        --mirror-log-dir)
+            MIRROR_LOG_DIR="$2"
             shift 2
             ;;
         --submit-script)
@@ -118,15 +128,31 @@ if [[ ! -d "$WORK_DIR" ]]; then
     echo "Error: --workdir does not exist: $WORK_DIR"
     exit 1
 fi
-
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 
-if [[ "$LOG_DIR" != /* ]]; then
-    LOG_DIR="${SCRIPT_DIR}/${LOG_DIR}"
+if [[ -z "$INPUT_DIR" ]]; then
+    INPUT_DIR="${WORK_DIR}/input"
+elif [[ "$INPUT_DIR" != /* ]]; then
+    INPUT_DIR="${WORK_DIR}/${INPUT_DIR}"
+fi
+
+if [[ -z "$LOG_DIR" ]]; then
+    LOG_DIR="${WORK_DIR}/logs"
+elif [[ "$LOG_DIR" != /* ]]; then
+    LOG_DIR="${WORK_DIR}/${LOG_DIR}"
+fi
+
+if [[ "$MIRROR_LOG_DIR" != /* ]]; then
+    MIRROR_LOG_DIR="${SCRIPT_DIR}/${MIRROR_LOG_DIR}"
 fi
 
 if [[ "$SUBMIT_SCRIPT" != /* ]]; then
     SUBMIT_SCRIPT="${SCRIPT_DIR}/${SUBMIT_SCRIPT}"
+fi
+
+if [[ ! -d "$INPUT_DIR" ]]; then
+    echo "Error: input directory does not exist: $INPUT_DIR"
+    exit 1
 fi
 
 if [[ ! -f "$SUBMIT_SCRIPT" ]]; then
@@ -136,36 +162,57 @@ fi
 
 required_files=("INCAR.start" "INCAR.cont" "KPOINTS" "POSCAR" "POTCAR")
 for req in "${required_files[@]}"; do
-    if [[ ! -f "$WORK_DIR/$req" ]]; then
-        echo "Error: required input file missing: $WORK_DIR/$req"
+    if [[ ! -f "$INPUT_DIR/$req" ]]; then
+        echo "Error: required input file missing: $INPUT_DIR/$req"
         exit 1
     fi
 done
 
+WORK_POSCAR="${WORK_DIR}/POSCAR"
+
 if [[ "$VALIDATE_ONLY" -eq 1 ]]; then
     echo "Validation successful."
-    echo "  Work dir:      $WORK_DIR"
-    echo "  Log dir:       $LOG_DIR"
-    echo "  Submit script: $SUBMIT_SCRIPT"
+    echo "  Work dir:         $WORK_DIR"
+    echo "  Input dir:        $INPUT_DIR"
+    echo "  Log dir:          $LOG_DIR"
+    echo "  Mirror log dir:   $MIRROR_LOG_DIR"
+    echo "  Submit script:    $SUBMIT_SCRIPT"
     if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
-        echo "  VASP exe:      $VASP_EXE_OVERRIDE"
+        echo "  VASP exe:         $VASP_EXE_OVERRIDE"
     else
-        echo "  VASP exe:      (from submit.sh default/env)"
+        echo "  VASP exe:         (from submit.sh default/env)"
     fi
-    echo "  Iterations:    $CONTINUE_FROM -> $MAX_ITER"
-    echo "  Monitor every: $MONITOR_INTERVAL seconds"
+    if [[ -f "$WORK_POSCAR" ]]; then
+        echo "  Start POSCAR:     $WORK_POSCAR (existing)"
+    else
+        echo "  Start POSCAR:     $INPUT_DIR/POSCAR (will seed $WORK_POSCAR)"
+    fi
+    echo "  Iterations:       $CONTINUE_FROM -> $MAX_ITER"
+    echo "  Monitor every:    $MONITOR_INTERVAL seconds"
     exit 0
 fi
 
-mkdir -p "$LOG_DIR"
+mkdir -p "$LOG_DIR" "$MIRROR_LOG_DIR"
+
 JOB_TAG="$(basename "$WORK_DIR" | tr -cs 'A-Za-z0-9._-' '_')"
-CHAIN_LOG="${LOG_DIR}/chain_${JOB_TAG}_$(date '+%Y%m%d_%H%M%S').log"
+CHAIN_BASENAME="chain_${JOB_TAG}_$(date '+%Y%m%d_%H%M%S').log"
+CHAIN_LOG="${LOG_DIR}/${CHAIN_BASENAME}"
+MIRROR_CHAIN_LOG="${MIRROR_LOG_DIR}/${CHAIN_BASENAME}"
+
+append_log_line() {
+    local line="$1"
+    echo "$line"
+    echo "$line" >> "$CHAIN_LOG"
+    if [[ "$MIRROR_CHAIN_LOG" != "$CHAIN_LOG" ]]; then
+        echo "$line" >> "$MIRROR_CHAIN_LOG"
+    fi
+}
 
 log_msg() {
     local msg="$1"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[$timestamp]  $msg" | tee -a "$CHAIN_LOG"
+    append_log_line "[$timestamp]  $msg"
 }
 
 log_iter() {
@@ -173,7 +220,7 @@ log_iter() {
     local msg="$2"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[$timestamp]  [ITER-$iter]  $msg" | tee -a "$CHAIN_LOG"
+    append_log_line "[$timestamp]  [ITER-$iter]  $msg"
 }
 
 # Parse elapsed strings from squeue %M into seconds.
@@ -220,18 +267,52 @@ get_queue_state_elapsed() {
     printf '%s\n' "$line"
 }
 
+# Extract a compact OUTCAR progress marker to keep chain logs informative.
+get_outcar_progress() {
+    local iter_dir="$1"
+    local line=""
+
+    if [[ ! -f "$iter_dir/OUTCAR" ]]; then
+        return 0
+    fi
+
+    line="$(grep -E 'Iteration[[:space:]]+[0-9]+\([[:space:]]*[0-9]+\)' "$iter_dir/OUTCAR" 2>/dev/null | tail -1 || true)"
+    if [[ -z "$line" ]]; then
+        return 0
+    fi
+
+    line="$(echo "$line" | sed -E 's/^[[:space:]-]+//; s/[[:space:]-]+$//; s/[[:space:]]+/ /g')"
+    printf '%s\n' "$line"
+}
+
+POSCAR_SEED_MSG=""
+if [[ ! -f "$WORK_POSCAR" ]]; then
+    PREV_ITER=$((CONTINUE_FROM - 1))
+    if [[ "$CONTINUE_FROM" -gt 1 && -s "$WORK_DIR/iteration-${PREV_ITER}/CONTCAR" ]]; then
+        cp -f "$WORK_DIR/iteration-${PREV_ITER}/CONTCAR" "$WORK_POSCAR"
+        POSCAR_SEED_MSG="Seeded runtime POSCAR from iteration-${PREV_ITER}/CONTCAR"
+    else
+        cp -f "$INPUT_DIR/POSCAR" "$WORK_POSCAR"
+        POSCAR_SEED_MSG="Seeded runtime POSCAR from input/POSCAR"
+    fi
+fi
+
 log_msg "=============================================================="
 log_msg "VASP Chain Automation Started"
 log_msg "Script dir:        $SCRIPT_DIR"
 log_msg "Work dir:          $WORK_DIR"
+log_msg "Input dir:         $INPUT_DIR"
 log_msg "Log file:          $CHAIN_LOG"
+if [[ "$MIRROR_CHAIN_LOG" != "$CHAIN_LOG" ]]; then
+    log_msg "Mirror log file:   $MIRROR_CHAIN_LOG"
+fi
 log_msg "Submit script:     $SUBMIT_SCRIPT"
 log_msg "Iterations:        $CONTINUE_FROM -> $MAX_ITER"
 log_msg "Job name prefix:   $JOB_PREFIX"
 if [[ -n "$VASP_EXE_OVERRIDE" ]]; then
-    log_msg "VASP executable:  $VASP_EXE_OVERRIDE (override)"
+    log_msg "VASP executable:   $VASP_EXE_OVERRIDE (override)"
 else
-    log_msg "VASP executable:  submit.sh default/env"
+    log_msg "VASP executable:   submit.sh default/env"
 fi
 if [[ -n "$SUCCESS_STRING" ]]; then
     log_msg "Success string:    '$SUCCESS_STRING'"
@@ -239,6 +320,9 @@ else
     log_msg "Success criteria:  non-empty CONTCAR after job completion"
 fi
 log_msg "Monitor interval:  $MONITOR_INTERVAL seconds"
+if [[ -n "$POSCAR_SEED_MSG" ]]; then
+    log_msg "$POSCAR_SEED_MSG"
+fi
 log_msg "=============================================================="
 
 iter="$CONTINUE_FROM"
@@ -256,16 +340,19 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         INCAR_SRC="INCAR.cont"
     fi
 
-    cp -f "$WORK_DIR/$INCAR_SRC" "$ITER_DIR/INCAR"
-    cp -f "$WORK_DIR/POSCAR" "$ITER_DIR/POSCAR"
-    cp -f "$WORK_DIR/KPOINTS" "$ITER_DIR/KPOINTS"
-    cp -f "$WORK_DIR/POTCAR" "$ITER_DIR/POTCAR"
-    rm -f "$ITER_DIR/STOPCAR" "$ITER_DIR/LABORT"
+    cp -f "$INPUT_DIR/$INCAR_SRC" "$ITER_DIR/INCAR"
+    cp -f "$WORK_POSCAR" "$ITER_DIR/POSCAR"
+    cp -f "$INPUT_DIR/KPOINTS" "$ITER_DIR/KPOINTS"
+    cp -f "$INPUT_DIR/POTCAR" "$ITER_DIR/POTCAR"
+    rm -f "$ITER_DIR/STOPCAR"
 
     for restart_file in WAVECAR CHGCAR; do
         if [[ -f "$WORK_DIR/$restart_file" ]]; then
             cp -f "$WORK_DIR/$restart_file" "$ITER_DIR/"
             log_iter "$iter" "Copied $restart_file for restart"
+        elif [[ "$iter" -eq 1 && -f "$INPUT_DIR/$restart_file" ]]; then
+            cp -f "$INPUT_DIR/$restart_file" "$ITER_DIR/"
+            log_iter "$iter" "Copied $restart_file from input dir"
         fi
     done
 
@@ -288,7 +375,6 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
     fi
 
     JOB_ID="$(sbatch "${SBATCH_ARGS[@]}" "$SUBMIT_SCRIPT" || true)"
-
     JOB_ID="${JOB_ID%%;*}"
 
     if [[ -z "$JOB_ID" || ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
@@ -314,7 +400,12 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         ELAPSED="${JOB_META#*|}"
         ELAPSED_SEC="$(elapsed_to_seconds "$ELAPSED")"
 
-        log_iter "$iter" "[Check $LOOP_COUNT] Status: $STATE | Elapsed: $ELAPSED ($ELAPSED_SEC s)"
+        OUTCAR_PROGRESS="$(get_outcar_progress "$ITER_DIR")"
+        if [[ -n "$OUTCAR_PROGRESS" ]]; then
+            log_iter "$iter" "[Check $LOOP_COUNT] Status: $STATE | Elapsed: $ELAPSED ($ELAPSED_SEC s) | OUTCAR: $OUTCAR_PROGRESS"
+        else
+            log_iter "$iter" "[Check $LOOP_COUNT] Status: $STATE | Elapsed: $ELAPSED ($ELAPSED_SEC s)"
+        fi
 
         if [[ "$STATE" == "MISSING" ]]; then
             MISSING_STATUS_COUNT=$((MISSING_STATUS_COUNT + 1))
@@ -396,8 +487,8 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
     fi
 
     if [[ -s "$ITER_DIR/CONTCAR" ]]; then
-        cp -f "$ITER_DIR/CONTCAR" "$WORK_DIR/POSCAR"
-        log_iter "$iter" "Copied CONTCAR to $WORK_DIR/POSCAR"
+        cp -f "$ITER_DIR/CONTCAR" "$WORK_POSCAR"
+        log_iter "$iter" "Copied CONTCAR to $WORK_POSCAR"
     else
         log_iter "$iter" "ERROR: CONTCAR missing or empty"
         exit 1
