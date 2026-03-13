@@ -199,8 +199,8 @@ done
 echo ""
 
 echo "Checking launch.sh timing values..."
-if grep -q "STOPCAR_TIME=79200" "$SCRIPT_DIR/launch.sh"; then
-    check_pass "STOPCAR_TIME is 79200 (22h)"
+if grep -q "STOPCAR_TIME=77400" "$SCRIPT_DIR/launch.sh"; then
+    check_pass "STOPCAR_TIME is 77400 (21.5h)"
 else
     check_warn "STOPCAR_TIME not found or modified"
 fi

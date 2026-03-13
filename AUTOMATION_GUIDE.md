@@ -72,14 +72,21 @@ For each successful iteration:
 
 Next iteration uses those files.
 
+Success-string behavior:
+- if the success string is found, the chain stops successfully
+- if the success string is not found but `CONTCAR` exists, the chain continues to the next iteration
+- if `CONTCAR` is missing or empty, the chain stops with an error
+
 Resume behavior:
 - if `--continue-from > 1` and `<jobdir>/POSCAR` is missing,
 - `launch.sh` seeds it from `iteration-(N-1)/CONTCAR` when available,
+- if `<jobdir>/WAVECAR` or `<jobdir>/CHGCAR` is missing,
+- `launch.sh` seeds them from `iteration-(N-1)` when available,
 - otherwise from input `POSCAR`.
 
 ## 5. STOPCAR/LABORT Behavior
 
-- At 22h elapsed runtime: write `LSTOP = .TRUE.` to `STOPCAR`
+- At 21.5h elapsed runtime: write `LSTOP = .TRUE.` to `STOPCAR`
 - At 23h elapsed runtime: append `LABORT = .TRUE.` to the same `STOPCAR` file
 - There is no separate control-file workflow required for LABORT in this automation.
 
@@ -182,9 +189,10 @@ nohup "$AUTOSLURM"/launch.sh \
 ## 9. Operational Notes
 
 Background reliability:
-- Wrapper uses 
-ohup`, background `&`, and `disown`.
+- Wrapper uses `nohup`, background `&`, and `disown`.
 - In most clusters this survives terminal close.
+- If the launcher receives a catchable shutdown signal (`SIGHUP`, `SIGTERM`, etc.), it writes that event into the chain log before exiting.
+- `SIGKILL` still cannot be trapped or logged from inside the launcher process.
 - If login-node process cleanup is enforced by site policy, use `tmux/screen` or request a persistent launcher method.
 
 SLURM target:

@@ -7,8 +7,11 @@ Highlights:
 - per-job working directories
 - input folder auto-detect: `input`, `inputs`, `INPUT`, `INPUTS`
 - iterative carry-over (`CONTCAR -> POSCAR`, plus `WAVECAR/CHGCAR`)
+- resume mode can re-seed `POSCAR`, `WAVECAR`, and `CHGCAR` from the previous iteration
+- if the success string is not reached yet, chaining continues as long as `CONTCAR` exists
 - dual logs: `<jobdir>/logs` and `<autoslurm>/logs`
 - wrapper submission via `nohup` so launcher continues after terminal close
+- launcher logs caught shutdown signals like `SIGHUP` and `SIGTERM` before exiting
 
 ## Quick Start
 
@@ -76,7 +79,7 @@ nohup "$AUTOSLURM"/launch.sh \
 
 - `submit.sh` baseline nodes: `#SBATCH -N 5`
 - per-run override: `--nodes N` (also prompted in wrapper)
-- STOPCAR timing: 22h (`79200s`)
+- STOPCAR timing: 21.5h (`77400s`)
 - LABORT timing: 23h (`82800s`) appended to `STOPCAR` (same file)
 
 ## Monitoring
@@ -89,6 +92,6 @@ tail -f <autoslurm>/logs/chain_<jobtag>_*.log
 
 ## Reliability Note
 
-`autoslurm-cli.sh` submits `launch.sh` with `nohup` + background + `disown`, so it keeps running after terminal close in normal cluster setups. If your site force-kills login-node user processes, use `tmux/screen` or ask admins for persistent launcher policy.
+`autoslurm-cli.sh` submits `launch.sh` with `nohup` + background + `disown`, so it keeps running after terminal close in normal cluster setups. If the launcher receives a catchable shutdown signal, it now writes that to the chain log before exiting. `SIGKILL` still cannot be trapped or logged from inside the process. If your site force-kills login-node user processes, use `tmux/screen` or ask admins for persistent launcher policy.
 
 For full operational details, see [AUTOMATION_GUIDE.md](./AUTOMATION_GUIDE.md).

@@ -18,7 +18,7 @@ MAX_ITER=20
 JOB_PREFIX="VASP-calc"
 SUCCESS_STRING=""
 MONITOR_INTERVAL=1800
-STOPCAR_TIME=79200
+STOPCAR_TIME=77400
 LABORT_TIME=82800
 WORK_DIR="$(pwd)"
 INPUT_DIR=""
@@ -247,6 +247,31 @@ log_iter() {
     append_log_line "[$timestamp]  [ITER-$iter]  $msg"
 }
 
+CURRENT_ITER=""
+
+log_shutdown_notice() {
+    local msg="$1"
+    if [[ -n "$CURRENT_ITER" ]]; then
+        log_iter "$CURRENT_ITER" "$msg"
+    else
+        log_msg "$msg"
+    fi
+}
+
+handle_signal() {
+    local signal_name="$1"
+    local exit_code="$2"
+    trap - HUP INT TERM QUIT PIPE
+    log_shutdown_notice "Launcher received ${signal_name}; background monitoring/submission is stopping"
+    exit "$exit_code"
+}
+
+trap 'handle_signal SIGHUP 129' HUP
+trap 'handle_signal SIGINT 130' INT
+trap 'handle_signal SIGQUIT 131' QUIT
+trap 'handle_signal SIGPIPE 141' PIPE
+trap 'handle_signal SIGTERM 143' TERM
+
 # Parse elapsed strings from squeue %M into seconds.
 # Supports D-HH:MM:SS, HH:MM:SS, and MM:SS.
 elapsed_to_seconds() {
@@ -321,6 +346,17 @@ if [[ ! -f "$WORK_POSCAR" ]]; then
     fi
 fi
 
+RESTART_SEED_MSGS=()
+if [[ "$CONTINUE_FROM" -gt 1 ]]; then
+    PREV_ITER=$((CONTINUE_FROM - 1))
+    for restart_file in WAVECAR CHGCAR; do
+        if [[ ! -f "$WORK_DIR/$restart_file" && -f "$WORK_DIR/iteration-${PREV_ITER}/$restart_file" ]]; then
+            cp -f "$WORK_DIR/iteration-${PREV_ITER}/$restart_file" "$WORK_DIR/$restart_file"
+            RESTART_SEED_MSGS+=("Seeded runtime $restart_file from iteration-${PREV_ITER}/$restart_file")
+        fi
+    done
+fi
+
 log_msg "=============================================================="
 log_msg "VASP Chain Automation Started"
 log_msg "Script dir:        $SCRIPT_DIR"
@@ -352,11 +388,15 @@ log_msg "Monitor interval:  $MONITOR_INTERVAL seconds"
 if [[ -n "$POSCAR_SEED_MSG" ]]; then
     log_msg "$POSCAR_SEED_MSG"
 fi
+for seed_msg in "${RESTART_SEED_MSGS[@]}"; do
+    log_msg "$seed_msg"
+done
 log_msg "=============================================================="
 
 iter="$CONTINUE_FROM"
 
 while [[ "$iter" -le "$MAX_ITER" ]]; do
+    CURRENT_ITER="$iter"
     log_iter "$iter" "--------------------------------------------------"
     log_iter "$iter" "Preparing iteration $iter of $MAX_ITER"
 
@@ -496,21 +536,20 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
     fi
 
     SUCCESS=0
+    CONVERGED=0
+    if [[ -s "$ITER_DIR/CONTCAR" ]]; then
+        SUCCESS=1
+        log_iter "$iter" "Checkpoint ready: CONTCAR is present and non-empty"
+    else
+        log_iter "$iter" "ERROR: CONTCAR missing or empty"
+    fi
+
     if [[ -n "$SUCCESS_STRING" ]]; then
         if grep -qF "$SUCCESS_STRING" "$ITER_DIR/OUTCAR" 2>/dev/null; then
             log_iter "$iter" "SUCCESS: found success string in OUTCAR"
-            SUCCESS=1
+            CONVERGED=1
         else
-            log_iter "$iter" "ERROR: success string not found in OUTCAR"
-            SUCCESS=0
-        fi
-    else
-        if [[ -s "$ITER_DIR/CONTCAR" ]]; then
-            log_iter "$iter" "SUCCESS: CONTCAR is present and non-empty"
-            SUCCESS=1
-        else
-            log_iter "$iter" "ERROR: CONTCAR missing or empty"
-            SUCCESS=0
+            log_iter "$iter" "Success string not found yet; continuing from checkpoint"
         fi
     fi
 
@@ -534,9 +573,16 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         fi
     done
 
+    if [[ "$CONVERGED" -eq 1 ]]; then
+        log_iter "$iter" "Convergence reached; stopping chain after iteration $iter"
+        break
+    fi
+
     iter=$((iter + 1))
     log_iter "$((iter - 1))" "Advancing to iteration $iter"
 done
+
+CURRENT_ITER=""
 
 log_msg "=============================================================="
 log_msg "Chain automation completed successfully"
