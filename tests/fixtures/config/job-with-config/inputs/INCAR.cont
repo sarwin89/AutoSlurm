@@ -1,0 +1,7 @@
+SYSTEM = AutoSlurm fixture restart
+ENCUT = 400
+ISTART = 1
+ICHARG = 1
+ISIF = 3
+IBRION = 2
+NSW = 20

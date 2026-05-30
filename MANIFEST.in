@@ -1,0 +1,11 @@
+include autoslurm-cli.sh
+include launch.sh
+include reset-run.sh
+include setup-check.sh
+include submit.sh
+include submit-cpu.sh
+recursive-include tests *.py
+recursive-include tests/fake_slurm/bin *
+recursive-include tests/fixtures *
+global-exclude ._*
+global-exclude __pycache__ *.py[cod]

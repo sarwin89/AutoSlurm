@@ -1,0 +1,2 @@
+VASP wrote something here, but this is not a valid CONTCAR.
+The file is non-empty so byte-size checks alone must not pass it.

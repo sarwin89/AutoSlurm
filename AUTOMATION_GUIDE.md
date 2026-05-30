@@ -1,10 +1,12 @@
 # AutoSlurm Automation Guide
 
-This document is the full operational reference. For a short setup path, use `README.md`.
+This is the practical reference for the milestone Python CLI and the supported
+legacy shell workflow.
 
-## 1. Design
+## 1. Operating Model
 
-AutoSlurm is built for one shared script directory and many independent job directories.
+AutoSlurm is built around one shared tool directory and many independent VASP
+job directories.
 
 ```text
 <autoslurm>/
@@ -16,138 +18,48 @@ AutoSlurm is built for one shared script directory and many independent job dire
   logs/
 
 <jobdir>/
+  autoslurm.yaml
   input|inputs|INPUT|INPUTS/
-    INCAR.start
-    INCAR.cont
-    KPOINTS
-    POSCAR
-    POTCAR
+  autoslurm-state.json
+  autoslurm-events.jsonl
   logs/
   iteration-1/
   iteration-2/
-  ...
   POSCAR
   WAVECAR
   CHGCAR
 ```
 
-Key behavior:
-- `launch.sh` reads static inputs from the detected input folder.
-- Runtime state is tracked in `<jobdir>` root (`POSCAR`, `WAVECAR`, `CHGCAR`).
-- Every chain log line is written to both job-local logs and AutoSlurm mirror logs.
+The Python CLI is additive. The shell scripts remain supported for existing
+cluster workflows and automation.
 
-## 2. Script Responsibilities
+## 2. Python CLI
 
-### `autoslurm-cli.sh`
-Interactive frontend that runs the full flow, asks for per-run node count, and submits `launch.sh` via 
-ohup`.
-
-### `setup-check.sh`
-Checks scripts, input files, SBATCH directives, scheduler commands, and launcher validation.
-
-### `launch.sh`
-Orchestrates iteration folders, submission, monitoring, STOPCAR/LABORT writing, success checks, and carry-over.
-
-### `reset-run.sh`
-Cleans full runs or from a specific iteration onward.
-
-### `submit.sh`
-Cluster submit runner. Default node count is `5` (`#SBATCH -N 5`).
-
-## 3. Input Folder Detection
-
-If `--input-dir` is not passed, AutoSlurm checks in order:
-1. `input`
-2. `inputs`
-3. `INPUT`
-4. `INPUTS`
-
-If none exist, it falls back to `<jobdir>/input` and fails with a clear message if files are missing.
-
-## 4. Runtime Carry-Over Rules
-
-For each successful iteration:
-- `CONTCAR` is copied to `<jobdir>/POSCAR`
-- `WAVECAR` and `CHGCAR` are copied to `<jobdir>/`
-
-Next iteration uses those files.
-
-Success-string behavior:
-- if the success string is found, the chain stops successfully
-- if the success string is not found but `CONTCAR` exists, the chain continues to the next iteration
-- if `CONTCAR` is missing or empty, the chain stops with an error
-
-Resume behavior:
-- if `--continue-from > 1` and `<jobdir>/POSCAR` is missing,
-- `launch.sh` seeds it from `iteration-(N-1)/CONTCAR` when available,
-- if `<jobdir>/WAVECAR` or `<jobdir>/CHGCAR` is missing,
-- `launch.sh` seeds them from `iteration-(N-1)` when available,
-- otherwise from input `POSCAR`.
-
-## 5. STOPCAR/LABORT Behavior
-
-- At 21.5h elapsed runtime: write `LSTOP = .TRUE.` to `STOPCAR`
-- At 23h elapsed runtime: append `LABORT = .TRUE.` to the same `STOPCAR` file
-- There is no separate control-file workflow required for LABORT in this automation.
-
-## 6. Monitoring Model
-
-Queue state source:
-- `squeue -h -j <jobid> -o "%T|%M"`
-
-Elapsed parsing is base-10 safe (fixes the `08` token arithmetic issue).
-
-Chain log check lines include OUTCAR progress snapshots when available, for example:
-- `OUTCAR: Iteration 1( 8)`
-
-## 7. Core Commands
-
-### Wrapper run (recommended)
+Use `autoslurm` after installation, or `python -m autoslurm` from a source
+checkout.
 
 ```bash
-AUTOSLURM=/pfs/home/shobhana/sarwin/AutoSlurm
-cd /pfs/home/shobhana/sarwin/bilayer-7/test
-"$AUTOSLURM"/autoslurm-cli.sh
+autoslurm init --workdir /path/to/job
+autoslurm check --workdir /path/to/job
+autoslurm doctor --workdir /path/to/job
+autoslurm run --workdir /path/to/job --dry-run
+autoslurm run --workdir /path/to/job
+autoslurm status --workdir /path/to/job
+autoslurm reset --workdir /path/to/job --from-iter 4
 ```
 
-### Manual validate + run
+Command responsibilities:
 
-```bash
-AUTOSLURM=/pfs/home/shobhana/sarwin/AutoSlurm
-JOBDIR=/pfs/home/shobhana/sarwin/bilayer-7/test
+- `init`: create a starter `autoslurm.yaml` in the job directory.
+- `check`: validate config, input files, output paths, and submit script. It must
+  not call `sbatch`.
+- `doctor`: run `check`, then verify scheduler tools on `PATH`.
+- `run --dry-run`: resolve config and show the planned chain without submitting.
+- `run`: submit and monitor the iterative SLURM chain.
+- `status`: summarize the latest state file, event log, and scheduler status.
+- `reset`: remove generated iterations and logs, optionally from iteration `N`.
 
-"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
-
-"$AUTOSLURM"/launch.sh --validate-only \
-  --workdir "$JOBDIR" \
-  --nodes 5 \
-  --vasp-exe /pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std
-
-nohup "$AUTOSLURM"/launch.sh \
-  --workdir "$JOBDIR" \
-  --name "AST-7r" \
-  --max-iter 5 \
-  --nodes 5 \
-  --monitor-interval 120 \
-  --success-string "stopping structural energy minimisation" \
-  --vasp-exe /pfs/home/shobhana/softwares/VASP-6.2.1/vasp.6.2.1/bin/vasp_std > "$JOBDIR"/logs/launcher_manual.log 2>&1 &
-```
-
-### Reset all
-
-```bash
-"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --yes
-```
-
-### Reset from iteration N
-
-```bash
-"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --from-iter 4 --yes
-```
-
-## 8. Option Reference
-
-### `launch.sh`
+Common flags:
 
 ```text
 --workdir PATH
@@ -162,58 +74,183 @@ nohup "$AUTOSLURM"/launch.sh \
 --name PREFIX
 --success-string TEXT
 --monitor-interval SEC
---validate-only
-```
-
-### `setup-check.sh`
-
-```text
---workdir PATH
---input-dir PATH
---submit-script PATH
---log-dir PATH
---mirror-log-dir PATH
---fix
-```
-
-### `reset-run.sh`
-
-```text
---workdir PATH
+--dry-run
 --from-iter N
---log-dir PATH
---mirror-log-dir PATH
---yes
 ```
 
-## 9. Operational Notes
+CLI flags override config values.
 
-Background reliability:
-- Wrapper uses `nohup`, background `&`, and `disown`.
-- In most clusters this survives terminal close.
-- If the launcher receives a catchable shutdown signal (`SIGHUP`, `SIGTERM`, etc.), it writes that event into the chain log before exiting.
-- `SIGKILL` still cannot be trapped or logged from inside the launcher process.
-- If login-node process cleanup is enforced by site policy, use `tmux/screen` or request a persistent launcher method.
+## 3. Config Format
 
-SLURM target:
-- Partition baseline is controlled in `submit.sh`.
-- Node baseline is `5` in `submit.sh`, and can be overridden per run using `--nodes` (wrapper prompt or CLI).
+`autoslurm.yaml` is the default config file written by `init`. `autoslurm.toml`
+is also discovered for legacy-friendly configs. Relative paths are resolved from
+the job directory.
+
+```toml
+[paths]
+input_dir = "inputs"
+log_dir = "configured-logs"
+mirror_log_dir = "mirror-logs"
+submit_script = "submit.sh"
+
+[run]
+name = "VASP-calc"
+continue_from = 2
+max_iter = 6
+monitor_interval = 300
+nodes = 4
+success_string = "reached required accuracy - stopping structural energy minimisation"
+
+[vasp]
+executable = "/opt/vasp/bin/vasp_std"
+```
+
+If `input_dir` is omitted, AutoSlurm checks in order: `input`, `inputs`,
+`INPUT`, `INPUTS`.
+
+## 4. State And Event Files
+
+The Python CLI and legacy launcher write runtime metadata in the job directory.
+
+`autoslurm-state.json` is the current snapshot:
+
+- resolved config and paths
+- latest run id
+- current iteration
+- active SLURM job id
+- last scheduler state and exit code
+- final outcome when the chain ends
+
+`autoslurm-events.jsonl` is append-only operational history:
+
+- config loaded and checks completed
+- dry-run plans
+- job submissions and scheduler status transitions
+- iteration start, completion, retry, and failure events
+- reset actions
+- VASP validation and fatal-error findings
+
+Use `autoslurm status --workdir PATH` for normal inspection. Keep manual edits to
+recovery cases with a backup.
+
+## 5. VASP-First Plugin Scope
+
+The plugin layer exists to keep domain logic separate from scheduler logic. This
+milestone supports VASP only:
+
+- required input files: `INCAR.start`, `INCAR.cont`, `KPOINTS`, `POSCAR`,
+  `POTCAR`
+- success detection from `OUTCAR` using the configured success string
+- structurally plausible, non-empty `CONTCAR` validation before carry-over
+- fatal log detection for common VASP failures such as `ZBRENT`, `BRMIX`,
+  `EDDDAV`, missing `POTCAR`, and corrupted `WAVECAR`
+- restart carry-over for `CONTCAR -> POSCAR`, `WAVECAR`, and `CHGCAR`
+
+Do not assume non-VASP engines are supported by this milestone.
+
+## 6. SLURM Monitoring
+
+The scheduler integration targets standard SLURM tools:
+
+- submit with `sbatch`
+- live status from `squeue`
+- terminal state fallback from `sacct`
+- cancellation through `scancel`
+
+The shell launcher still uses `squeue -h -j <jobid> -o "%T|%M"` for live
+monitoring. The Python scheduler should also check `sacct` when a job disappears
+from `squeue`.
+
+## 7. Fake-SLURM Tests
+
+Tests can run without a real cluster by prepending fake SLURM commands to
+`PATH`. The fake cluster stores scheduler state in a JSON file selected by
+`FAKE_SLURM_STATE`.
+
+```bash
+PYTHONPATH=. pytest tests
+```
+
+The fake tools cover `sbatch`, `squeue`, `sacct`, and `scancel`, including
+successful jobs, failures, timeouts, cancellations, preemption, out-of-memory
+states, and jobs that disappear from `squeue` before `sacct` reports the final
+state.
+
+## 8. Legacy Shell Commands
+
+These commands remain supported:
+
+### Interactive wrapper
+
+```bash
+AUTOSLURM=/path/to/AutoSlurm
+cd /path/to/job
+"$AUTOSLURM"/autoslurm-cli.sh
+```
+
+### Manual validate and run
+
+```bash
+AUTOSLURM=/path/to/AutoSlurm
+JOBDIR=/path/to/job
+
+"$AUTOSLURM"/setup-check.sh --workdir "$JOBDIR"
+
+"$AUTOSLURM"/launch.sh --validate-only \
+  --workdir "$JOBDIR" \
+  --nodes 5 \
+  --vasp-exe /path/to/vasp_std
+
+nohup "$AUTOSLURM"/launch.sh \
+  --workdir "$JOBDIR" \
+  --name "VASP-calc" \
+  --max-iter 5 \
+  --nodes 5 \
+  --monitor-interval 120 \
+  --success-string "stopping structural energy minimisation" \
+  --vasp-exe /path/to/vasp_std > "$JOBDIR"/logs/launcher_manual.log 2>&1 &
+```
+
+### Reset
+
+```bash
+"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --yes
+"$AUTOSLURM"/reset-run.sh --workdir "$JOBDIR" --from-iter 4 --yes
+```
+
+## 9. Runtime Behavior
+
+- Static VASP inputs are read from the configured or detected input directory.
+- Runtime `POSCAR`, `WAVECAR`, and `CHGCAR` live in the job directory root.
+- Each iteration runs in `iteration-N/`.
+- On successful iteration completion, `CONTCAR` becomes the next runtime
+  `POSCAR`; `WAVECAR` and `CHGCAR` are carried forward when present.
+- If the success string is found, the chain stops successfully.
+- If the success string is not found but `CONTCAR` is valid, the next iteration
+  starts.
+- If `CONTCAR` is missing, empty, or structurally invalid, the chain stops with
+  an error.
+
+Shell STOPCAR behavior remains:
+
+- at 21.5h elapsed runtime, write `LSTOP = .TRUE.` to `STOPCAR`
+- at 23h elapsed runtime, append `LABORT = .TRUE.` to the same `STOPCAR`
 
 ## 10. Troubleshooting
 
-### `execvp error on file vasp_std`
-Use `--vasp-exe` with full executable path.
+`execvp error on file vasp_std`: set `[vasp].executable` or pass
+`--vasp-exe /full/path/to/vasp_std`.
 
-### Monitoring fails with `value too great for base`
-Fixed in current `launch.sh` by base-10-safe elapsed conversion.
+No input folder found: create `input`, `inputs`, `INPUT`, or `INPUTS`, or set
+`[paths].input_dir`.
 
-### No input folder found
-Create one of: `input`, `inputs`, `INPUT`, `INPUTS` with required VASP files.
+Dry run submits anyway: this is a bug. `autoslurm run --dry-run` and
+`autoslurm check` must not call `sbatch`.
 
-### Chain log stopped updating
-Check launcher process:
+Chain log stopped updating: check the Python status first, then check the legacy
+launcher process if using shell commands:
+
 ```bash
+autoslurm status --workdir "$JOBDIR"
 pgrep -af launch.sh
 ```
-If absent, relaunch using wrapper or manual 
-ohup` command.

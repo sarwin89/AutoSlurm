@@ -1,0 +1,15 @@
+[paths]
+input_dir = "inputs"
+log_dir = "configured-logs"
+mirror_log_dir = "mirror-logs"
+submit_script = "submit.sh"
+
+[run]
+continue_from = 2
+max_iter = 6
+monitor_interval = 300
+nodes = 4
+success_string = "reached required accuracy - stopping structural energy minimisation"
+
+[vasp]
+executable = "/opt/vasp/bin/vasp_std"

@@ -1,0 +1,5 @@
+SYSTEM = AutoSlurm fixture
+ENCUT = 400
+ISIF = 3
+IBRION = 2
+NSW = 20

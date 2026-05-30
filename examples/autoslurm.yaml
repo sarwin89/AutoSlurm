@@ -1,0 +1,27 @@
+workflow:
+  code: vasp
+  name: MoS2-relax
+  max_iter: 5
+
+scheduler:
+  type: slurm
+  partition: cpu
+  nodes: 5
+  ntasks_per_node: 24
+  walltime: "24:00:00"
+
+run:
+  executable: vasp_std
+  mpi: mpiexec.hydra
+  modules:
+    - compilers/intel2017/composer_xe_2017/default
+
+vasp:
+  input_dir: input
+  incar_start: INCAR.start
+  incar_continue: INCAR.cont
+  success_strings:
+    - stopping structural energy minimisation
+  carry:
+    - WAVECAR
+    - CHGCAR

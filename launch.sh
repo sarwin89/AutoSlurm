@@ -1,6 +1,6 @@
 #!/bin/bash
 ################################################################################
-# launch.sh - Automated VASP iteration orchestrator (squeue-only monitoring)
+# launch.sh - Automated VASP iteration orchestrator (squeue/sacct monitoring)
 #
 # Centralized usage:
 #   - Keep automation scripts in one AutoSlurm folder.
@@ -28,6 +28,22 @@ SUBMIT_SCRIPT="${SCRIPT_DIR}/submit.sh"
 NODES_OVERRIDE=""
 VASP_EXE_OVERRIDE=""
 VALIDATE_ONLY=0
+RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+STATE_FILE=""
+EVENTS_FILE=""
+WORKFLOW_STATUS="initializing"
+CURRENT_ITER=""
+CURRENT_JOB_ID=""
+CURRENT_JOB_NAME=""
+CURRENT_JOB_STATE=""
+CURRENT_JOB_ELAPSED=""
+CURRENT_JOB_ELAPSED_SECONDS=""
+LAST_FINAL_STATE=""
+LAST_FINAL_STATE_SOURCE=""
+LAST_EXIT_CODE=""
+LAST_FAILURE_REASON=""
+LAST_COMPLETED_ITER=""
+WORKFLOW_CONVERGED=0
 
 print_usage() {
     echo "Usage: $0 [options]"
@@ -140,6 +156,8 @@ if [[ ! -d "$WORK_DIR" ]]; then
     exit 1
 fi
 WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+STATE_FILE="${WORK_DIR}/autoslurm-state.json"
+EVENTS_FILE="${WORK_DIR}/autoslurm-events.jsonl"
 
 if [[ -z "$INPUT_DIR" ]]; then
     for candidate in input inputs INPUT INPUTS; do
@@ -247,7 +265,166 @@ log_iter() {
     append_log_line "[$timestamp]  [ITER-$iter]  $msg"
 }
 
-CURRENT_ITER=""
+utc_timestamp() {
+    date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+json_quote() {
+    local value="${1-}"
+    value="${value//\\/\\\\}"
+    value="${value//\"/\\\"}"
+    value="${value//$'\n'/\\n}"
+    value="${value//$'\r'/\\r}"
+    value="${value//$'\t'/\\t}"
+    printf '"%s"' "$value"
+}
+
+write_state_snapshot() {
+    local last_event="${1:-}"
+    local updated_at="${2:-$(utc_timestamp)}"
+    local tmp
+
+    if [[ -z "${STATE_FILE:-}" ]]; then
+        return 0
+    fi
+
+    tmp="${STATE_FILE}.tmp.$$"
+    if {
+        printf '{\n'
+        printf '  "schema_version": 1,\n'
+        printf '  "run_id": %s,\n' "$(json_quote "$RUN_ID")"
+        printf '  "updated_at": %s,\n' "$(json_quote "$updated_at")"
+        printf '  "status": %s,\n' "$(json_quote "$WORKFLOW_STATUS")"
+        printf '  "last_event": %s,\n' "$(json_quote "$last_event")"
+        printf '  "work_dir": %s,\n' "$(json_quote "$WORK_DIR")"
+        printf '  "input_dir": %s,\n' "$(json_quote "$INPUT_DIR")"
+        printf '  "log_dir": %s,\n' "$(json_quote "$LOG_DIR")"
+        printf '  "mirror_log_dir": %s,\n' "$(json_quote "$MIRROR_LOG_DIR")"
+        printf '  "chain_log": %s,\n' "$(json_quote "${CHAIN_LOG:-}")"
+        printf '  "mirror_chain_log": %s,\n' "$(json_quote "${MIRROR_CHAIN_LOG:-}")"
+        printf '  "submit_script": %s,\n' "$(json_quote "$SUBMIT_SCRIPT")"
+        printf '  "continue_from": %s,\n' "$(json_quote "$CONTINUE_FROM")"
+        printf '  "max_iter": %s,\n' "$(json_quote "$MAX_ITER")"
+        printf '  "job_prefix": %s,\n' "$(json_quote "$JOB_PREFIX")"
+        printf '  "current_iteration": %s,\n' "$(json_quote "${CURRENT_ITER:-}")"
+        printf '  "current_job_id": %s,\n' "$(json_quote "${CURRENT_JOB_ID:-}")"
+        printf '  "current_job_name": %s,\n' "$(json_quote "${CURRENT_JOB_NAME:-}")"
+        printf '  "current_job_state": %s,\n' "$(json_quote "${CURRENT_JOB_STATE:-}")"
+        printf '  "current_job_elapsed": %s,\n' "$(json_quote "${CURRENT_JOB_ELAPSED:-}")"
+        printf '  "current_job_elapsed_seconds": %s,\n' "$(json_quote "${CURRENT_JOB_ELAPSED_SECONDS:-}")"
+        printf '  "last_final_state": %s,\n' "$(json_quote "${LAST_FINAL_STATE:-}")"
+        printf '  "last_final_state_source": %s,\n' "$(json_quote "${LAST_FINAL_STATE_SOURCE:-}")"
+        printf '  "last_exit_code": %s,\n' "$(json_quote "${LAST_EXIT_CODE:-}")"
+        printf '  "last_failure_reason": %s,\n' "$(json_quote "${LAST_FAILURE_REASON:-}")"
+        printf '  "last_completed_iteration": %s,\n' "$(json_quote "${LAST_COMPLETED_ITER:-}")"
+        printf '  "converged": %s,\n' "$(json_quote "$WORKFLOW_CONVERGED")"
+        printf '  "state_file": %s,\n' "$(json_quote "${STATE_FILE:-}")"
+        printf '  "events_file": %s\n' "$(json_quote "${EVENTS_FILE:-}")"
+        printf '}\n'
+    } > "$tmp"; then
+        mv -f "$tmp" "$STATE_FILE" || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+
+    return 0
+}
+
+record_event() {
+    local event="$1"
+    shift
+    local timestamp
+    local json
+    local kv
+    local key
+    local value
+
+    if [[ -z "${EVENTS_FILE:-}" ]]; then
+        return 0
+    fi
+
+    timestamp="$(utc_timestamp)"
+    json="{\"timestamp\":$(json_quote "$timestamp"),\"event\":$(json_quote "$event"),\"run_id\":$(json_quote "$RUN_ID"),\"status\":$(json_quote "$WORKFLOW_STATUS")"
+    for kv in "$@"; do
+        key="${kv%%=*}"
+        value="${kv#*=}"
+        json+=",\"${key}\":$(json_quote "$value")"
+    done
+    json+="}"
+
+    printf '%s\n' "$json" >> "$EVENTS_FILE" || true
+    write_state_snapshot "$event" "$timestamp"
+    return 0
+}
+
+record_final_state() {
+    local iter="$1"
+    local job_id="$2"
+    local state="$3"
+    local source="$4"
+    local exit_code="${5:-}"
+    local reason="${6:-}"
+    local elapsed="${7:-}"
+    local raw_state="${8:-}"
+
+    CURRENT_JOB_STATE="$state"
+    if [[ -n "$elapsed" ]]; then
+        CURRENT_JOB_ELAPSED="$elapsed"
+        CURRENT_JOB_ELAPSED_SECONDS="$(elapsed_to_seconds "$elapsed")"
+    fi
+    LAST_FINAL_STATE="$state"
+    LAST_FINAL_STATE_SOURCE="$source"
+    LAST_EXIT_CODE="$exit_code"
+
+    record_event "final_state" \
+        "iteration=$iter" \
+        "job_id=$job_id" \
+        "state=$state" \
+        "source=$source" \
+        "exit_code=$exit_code" \
+        "reason=$reason" \
+        "elapsed=$elapsed" \
+        "raw_state=$raw_state"
+}
+
+record_workflow_failure() {
+    local reason="$1"
+    local launcher_exit_code="${2:-1}"
+
+    WORKFLOW_STATUS="failed"
+    LAST_FAILURE_REASON="$reason"
+    record_event "workflow_failure" \
+        "iteration=${CURRENT_ITER:-}" \
+        "job_id=${CURRENT_JOB_ID:-}" \
+        "state=${CURRENT_JOB_STATE:-}" \
+        "reason=$reason" \
+        "launcher_exit_code=$launcher_exit_code"
+}
+
+fail_iteration_and_workflow() {
+    local iter="$1"
+    local reason="$2"
+    local state="${3:-${CURRENT_JOB_STATE:-}}"
+
+    WORKFLOW_STATUS="failed"
+    LAST_FAILURE_REASON="$reason"
+    if [[ -n "$state" ]]; then
+        CURRENT_JOB_STATE="$state"
+    fi
+
+    record_event "iteration_failure" \
+        "iteration=$iter" \
+        "job_id=${CURRENT_JOB_ID:-}" \
+        "state=${CURRENT_JOB_STATE:-}" \
+        "reason=$reason"
+    record_event "workflow_failure" \
+        "iteration=$iter" \
+        "job_id=${CURRENT_JOB_ID:-}" \
+        "state=${CURRENT_JOB_STATE:-}" \
+        "reason=$reason" \
+        "launcher_exit_code=1"
+    exit 1
+}
 
 log_shutdown_notice() {
     local msg="$1"
@@ -263,6 +440,7 @@ handle_signal() {
     local exit_code="$2"
     trap - HUP INT TERM QUIT PIPE
     log_shutdown_notice "Launcher received ${signal_name}; background monitoring/submission is stopping"
+    record_workflow_failure "received ${signal_name}" "$exit_code"
     exit "$exit_code"
 }
 
@@ -314,6 +492,95 @@ get_queue_state_elapsed() {
     fi
 
     printf '%s\n' "$line"
+}
+
+is_failure_state() {
+    case "$1" in
+        CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+is_terminal_state() {
+    case "$1" in
+        COMPLETED|CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+normalize_sacct_state() {
+    local raw_state="${1:-}"
+    local state
+
+    state="$(printf '%s' "$raw_state" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' | tr '[:lower:]' '[:upper:]')"
+    state="${state%% *}"
+    state="${state%%+*}"
+
+    if is_terminal_state "$state"; then
+        printf '%s\n' "$state"
+        return 0
+    fi
+
+    return 1
+}
+
+# Returns STATE|EXIT_CODE|REASON|ELAPSED|RAW_STATE.
+# STATE is one of the recognized terminal states, UNKNOWN, or UNAVAILABLE.
+get_accounting_final_state() {
+    local job_id="$1"
+    local output
+    local line
+    local raw_job_id
+    local raw_state
+    local exit_code
+    local reason
+    local elapsed
+    local normalized_state
+    local first_terminal=""
+
+    if ! command -v sacct >/dev/null 2>&1; then
+        printf 'UNAVAILABLE||||\n'
+        return 0
+    fi
+
+    output="$(sacct -n -P -j "$job_id" -o JobIDRaw,State%32,ExitCode,Reason%80,Elapsed 2>/dev/null || true)"
+    if [[ -z "$output" ]]; then
+        printf 'UNKNOWN||||\n'
+        return 0
+    fi
+
+    while IFS='|' read -r raw_job_id raw_state exit_code reason elapsed _; do
+        if [[ -z "${raw_job_id}${raw_state}" ]]; then
+            continue
+        fi
+
+        normalized_state="$(normalize_sacct_state "$raw_state" || true)"
+        if [[ -z "$normalized_state" ]]; then
+            continue
+        fi
+
+        line="${normalized_state}|${exit_code}|${reason}|${elapsed}|${raw_state}"
+        raw_job_id="${raw_job_id%%.*}"
+        if [[ "$raw_job_id" == "$job_id" ]]; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+
+        if [[ -z "$first_terminal" ]]; then
+            first_terminal="$line"
+        fi
+    done <<< "$output"
+
+    if [[ -n "$first_terminal" ]]; then
+        printf '%s\n' "$first_terminal"
+        return 0
+    fi
+
+    printf 'UNKNOWN||||\n'
 }
 
 # Extract a compact OUTCAR progress marker to keep chain logs informative.
@@ -388,10 +655,21 @@ log_msg "Monitor interval:  $MONITOR_INTERVAL seconds"
 if [[ -n "$POSCAR_SEED_MSG" ]]; then
     log_msg "$POSCAR_SEED_MSG"
 fi
-for seed_msg in "${RESTART_SEED_MSGS[@]}"; do
-    log_msg "$seed_msg"
-done
+if [[ "${#RESTART_SEED_MSGS[@]}" -gt 0 ]]; then
+    for seed_msg in "${RESTART_SEED_MSGS[@]}"; do
+        log_msg "$seed_msg"
+    done
+fi
 log_msg "=============================================================="
+
+WORKFLOW_STATUS="running"
+record_event "workflow_start" \
+    "continue_from=$CONTINUE_FROM" \
+    "max_iter=$MAX_ITER" \
+    "job_prefix=$JOB_PREFIX" \
+    "monitor_interval=$MONITOR_INTERVAL" \
+    "chain_log=$CHAIN_LOG" \
+    "mirror_chain_log=$MIRROR_CHAIN_LOG"
 
 iter="$CONTINUE_FROM"
 
@@ -430,6 +708,14 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
     JOB_NAME="${JOB_PREFIX}-iter-${iter}"
     JOB_OUTPUT="${ITER_DIR}/job.%J.out"
     JOB_ERROR="${ITER_DIR}/job.%J.err"
+    CURRENT_JOB_ID=""
+    CURRENT_JOB_NAME="$JOB_NAME"
+    CURRENT_JOB_STATE="SUBMITTING"
+    CURRENT_JOB_ELAPSED=""
+    CURRENT_JOB_ELAPSED_SECONDS=""
+    LAST_FINAL_STATE=""
+    LAST_FINAL_STATE_SOURCE=""
+    LAST_EXIT_CODE=""
 
     SBATCH_ARGS=(
         --chdir="$ITER_DIR"
@@ -452,16 +738,24 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
 
     if [[ -z "$JOB_ID" || ! "$JOB_ID" =~ ^[0-9]+$ ]]; then
         log_iter "$iter" "ERROR: sbatch failed (job id: '$JOB_ID')"
-        exit 1
+        fail_iteration_and_workflow "$iter" "sbatch failed (job id: '$JOB_ID')" "SUBMIT_FAILED"
     fi
 
     log_iter "$iter" "Submitted job ID: $JOB_ID"
+    CURRENT_JOB_ID="$JOB_ID"
+    CURRENT_JOB_STATE="SUBMITTED"
+    record_event "job_submit" \
+        "iteration=$iter" \
+        "job_id=$JOB_ID" \
+        "job_name=$JOB_NAME" \
+        "iter_dir=$ITER_DIR"
 
     STOPCAR_WRITTEN=0
     LABORT_WRITTEN=0
     LOOP_COUNT=0
     MISSING_STATUS_COUNT=0
     STATE="PENDING"
+    FINAL_STATE_RECORDED=0
 
     log_iter "$iter" "Starting job monitoring (squeue)"
 
@@ -472,6 +766,9 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         STATE="${JOB_META%%|*}"
         ELAPSED="${JOB_META#*|}"
         ELAPSED_SEC="$(elapsed_to_seconds "$ELAPSED")"
+        CURRENT_JOB_STATE="$STATE"
+        CURRENT_JOB_ELAPSED="$ELAPSED"
+        CURRENT_JOB_ELAPSED_SECONDS="$ELAPSED_SEC"
 
         OUTCAR_PROGRESS="$(get_outcar_progress "$ITER_DIR")"
         if [[ -n "$OUTCAR_PROGRESS" ]]; then
@@ -479,12 +776,40 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         else
             log_iter "$iter" "[Check $LOOP_COUNT] Status: $STATE | Elapsed: $ELAPSED ($ELAPSED_SEC s)"
         fi
+        record_event "poll" \
+            "iteration=$iter" \
+            "job_id=$JOB_ID" \
+            "loop=$LOOP_COUNT" \
+            "state=$STATE" \
+            "elapsed=$ELAPSED" \
+            "elapsed_seconds=$ELAPSED_SEC" \
+            "outcar_progress=$OUTCAR_PROGRESS"
 
         if [[ "$STATE" == "MISSING" ]]; then
             MISSING_STATUS_COUNT=$((MISSING_STATUS_COUNT + 1))
             if [[ "$MISSING_STATUS_COUNT" -ge 2 ]]; then
-                log_iter "$iter" "Job left queue; assuming it finished"
-                STATE="FINISHED"
+                ACCOUNTING_META="$(get_accounting_final_state "$JOB_ID")"
+                IFS='|' read -r ACCOUNTING_STATE ACCOUNTING_EXIT_CODE ACCOUNTING_REASON ACCOUNTING_ELAPSED ACCOUNTING_RAW_STATE <<< "$ACCOUNTING_META"
+
+                if is_terminal_state "$ACCOUNTING_STATE"; then
+                    STATE="$ACCOUNTING_STATE"
+                    if [[ -n "$ACCOUNTING_ELAPSED" ]]; then
+                        ELAPSED="$ACCOUNTING_ELAPSED"
+                    fi
+                    log_iter "$iter" "Job left queue; sacct final state: $STATE"
+                    record_final_state "$iter" "$JOB_ID" "$STATE" "sacct" "$ACCOUNTING_EXIT_CODE" "$ACCOUNTING_REASON" "$ELAPSED" "$ACCOUNTING_RAW_STATE"
+                    FINAL_STATE_RECORDED=1
+                else
+                    STATE="FINISHED"
+                    if [[ "$ACCOUNTING_STATE" == "UNAVAILABLE" ]]; then
+                        log_iter "$iter" "Job left queue; assuming it finished"
+                        record_final_state "$iter" "$JOB_ID" "$STATE" "assumed" "" "sacct unavailable" "$ELAPSED" "$ACCOUNTING_STATE"
+                    else
+                        log_iter "$iter" "Job left queue; sacct final state unavailable; assuming it finished"
+                        record_final_state "$iter" "$JOB_ID" "$STATE" "sacct_unknown" "" "sacct returned no terminal state" "$ELAPSED" "$ACCOUNTING_STATE"
+                    fi
+                    FINAL_STATE_RECORDED=1
+                fi
                 break
             fi
             sleep "$MONITOR_INTERVAL"
@@ -513,26 +838,32 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
             LABORT_WRITTEN=1
         fi
 
-        case "$STATE" in
-            CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
+        if is_terminal_state "$STATE"; then
+            if is_failure_state "$STATE"; then
                 log_iter "$iter" "Job entered terminal failure state: $STATE"
-                break
-                ;;
-        esac
+            else
+                log_iter "$iter" "Job entered terminal state: $STATE"
+            fi
+            record_final_state "$iter" "$JOB_ID" "$STATE" "squeue" "" "" "$ELAPSED" "$STATE"
+            FINAL_STATE_RECORDED=1
+            break
+        fi
 
         sleep "$MONITOR_INTERVAL"
     done
 
-    case "$STATE" in
-        CANCELLED|FAILED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED)
-            log_iter "$iter" "ERROR: iteration failed in queue state $STATE"
-            exit 1
-            ;;
-    esac
+    if [[ "$FINAL_STATE_RECORDED" -eq 0 ]]; then
+        record_final_state "$iter" "$JOB_ID" "$STATE" "launcher" "" "" "$ELAPSED" "$STATE"
+    fi
+
+    if is_failure_state "$STATE"; then
+        log_iter "$iter" "ERROR: iteration failed in final state $STATE"
+        fail_iteration_and_workflow "$iter" "iteration failed in final state $STATE" "$STATE"
+    fi
 
     if [[ ! -f "$ITER_DIR/OUTCAR" ]]; then
         log_iter "$iter" "ERROR: OUTCAR missing after job completion"
-        exit 1
+        fail_iteration_and_workflow "$iter" "OUTCAR missing after job completion" "$STATE"
     fi
 
     SUCCESS=0
@@ -555,7 +886,7 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
 
     if [[ "$SUCCESS" -ne 1 ]]; then
         log_iter "$iter" "Stopping chain at iteration $iter"
-        exit 1
+        fail_iteration_and_workflow "$iter" "CONTCAR missing or empty" "$STATE"
     fi
 
     if [[ -s "$ITER_DIR/CONTCAR" ]]; then
@@ -563,7 +894,7 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
         log_iter "$iter" "Copied CONTCAR to $WORK_POSCAR"
     else
         log_iter "$iter" "ERROR: CONTCAR missing or empty"
-        exit 1
+        fail_iteration_and_workflow "$iter" "CONTCAR missing or empty" "$STATE"
     fi
 
     for restart_file in WAVECAR CHGCAR; do
@@ -572,6 +903,14 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
             log_iter "$iter" "Copied $restart_file back to work dir"
         fi
     done
+
+    LAST_COMPLETED_ITER="$iter"
+    WORKFLOW_CONVERGED="$CONVERGED"
+    record_event "iteration_success" \
+        "iteration=$iter" \
+        "job_id=$JOB_ID" \
+        "state=$STATE" \
+        "converged=$CONVERGED"
 
     if [[ "$CONVERGED" -eq 1 ]]; then
         log_iter "$iter" "Convergence reached; stopping chain after iteration $iter"
@@ -583,6 +922,11 @@ while [[ "$iter" -le "$MAX_ITER" ]]; do
 done
 
 CURRENT_ITER=""
+WORKFLOW_STATUS="completed"
+record_event "workflow_complete" \
+    "final_iteration=${LAST_COMPLETED_ITER:-$((iter - 1))}" \
+    "max_iter=$MAX_ITER" \
+    "converged=$WORKFLOW_CONVERGED"
 
 log_msg "=============================================================="
 log_msg "Chain automation completed successfully"
