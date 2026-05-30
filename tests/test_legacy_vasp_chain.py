@@ -207,3 +207,42 @@ def test_launch_fails_when_sacct_reports_failure_after_squeue_disappears(tmp_pat
         for line in (job_dir / "autoslurm-events.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert any(event["event"] == "workflow_failure" for event in events)
+
+
+def test_launch_writes_stopcar_and_labort_before_walltime(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    mirror_log_dir = tmp_path / "mirror-logs"
+    job_dir.mkdir()
+    mirror_log_dir.mkdir()
+    input_dir = _copy_valid_input(job_dir)
+    submit_script = _write_submit_script(tmp_path / "submit.sh")
+    cluster = FakeSlurmCluster(tmp_path / "fake-slurm.json")
+    cluster.plan_job(
+        squeue_states=[
+            {"state": "RUNNING", "elapsed": "21:30:00"},
+            {"state": "RUNNING", "elapsed": "23:00:00"},
+            {"state": "COMPLETED", "elapsed": "23:01:00"},
+        ],
+        sacct_state="COMPLETED",
+        exit_code="0:0",
+        artifacts={
+            "OUTCAR": (FIXTURES / "vasp" / "outcar" / "success-default.OUTCAR").read_text(encoding="utf-8"),
+            "CONTCAR": (FIXTURES / "vasp" / "contcar" / "valid.CONTCAR").read_text(encoding="utf-8"),
+        },
+    )
+
+    result = _run_launch(
+        cluster,
+        tmp_path,
+        job_dir,
+        input_dir,
+        submit_script,
+        mirror_log_dir,
+        max_iter=1,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    stopcar = (job_dir / "iteration-1" / "STOPCAR").read_text(encoding="utf-8")
+    assert "LSTOP = .TRUE." in stopcar
+    assert "LABORT = .TRUE." in stopcar
