@@ -236,7 +236,7 @@ fi
 
 mkdir -p "$LOG_DIR" "$MIRROR_LOG_DIR"
 
-JOB_TAG="$(basename "$WORK_DIR" | tr -cs 'A-Za-z0-9._-' '_')"
+JOB_TAG="$(printf '%s' "$(basename "$WORK_DIR")" | tr -cs 'A-Za-z0-9._-' '_')"
 CHAIN_BASENAME="chain_${JOB_TAG}_$(date '+%Y%m%d_%H%M%S').log"
 CHAIN_LOG="${LOG_DIR}/${CHAIN_BASENAME}"
 MIRROR_CHAIN_LOG="${MIRROR_LOG_DIR}/${CHAIN_BASENAME}"

@@ -75,7 +75,7 @@ if [[ -n "$FROM_ITER" ]]; then
     fi
 fi
 
-JOB_TAG="$(basename "$WORK_DIR" | tr -cs 'A-Za-z0-9._-' '_')"
+JOB_TAG="$(printf '%s' "$(basename "$WORK_DIR")" | tr -cs 'A-Za-z0-9._-' '_')"
 
 shopt -s nullglob
 
