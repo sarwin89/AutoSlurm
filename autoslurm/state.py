@@ -30,6 +30,7 @@ class WorkflowState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WorkflowState":
+        data = _normalize_state_data(data)
         allowed = set(cls.__dataclass_fields__)
         return cls(**{key: value for key, value in data.items() if key in allowed})
 
@@ -60,3 +61,38 @@ class StateStore:
 
 def default_state_store(workdir: Path) -> StateStore:
     return StateStore(workdir / "autoslurm-state.json")
+
+
+def _normalize_state_data(data: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(data)
+    if "workflow_id" not in normalized and normalized.get("run_id"):
+        normalized["workflow_id"] = str(normalized["run_id"])
+    if "name" not in normalized and normalized.get("job_prefix"):
+        normalized["name"] = str(normalized["job_prefix"])
+    if "final_status" not in normalized and normalized.get("status"):
+        normalized["final_status"] = str(normalized["status"])
+    if "failure_reason" not in normalized and normalized.get("last_failure_reason"):
+        normalized["failure_reason"] = str(normalized["last_failure_reason"])
+
+    if normalized.get("current_iteration") not in (None, ""):
+        normalized["current_iteration"] = _safe_int(normalized.get("current_iteration"), 0)
+    elif normalized.get("last_completed_iteration") not in (None, ""):
+        normalized["current_iteration"] = _safe_int(normalized.get("last_completed_iteration"), 0)
+
+    current_job_id = str(normalized.get("current_job_id") or "")
+    if current_job_id and "submitted_job_ids" not in normalized:
+        normalized["submitted_job_ids"] = [current_job_id]
+    if current_job_id and "job_states" not in normalized:
+        state = normalized.get("current_job_state") or normalized.get("last_final_state") or "UNKNOWN"
+        normalized["job_states"] = {current_job_id: str(state)}
+
+    return normalized
+
+
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        if value in (None, ""):
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default

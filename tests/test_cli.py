@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import subprocess
@@ -164,3 +165,53 @@ def test_python_doctor_runs_against_fake_scheduler_tools(tmp_path: Path) -> None
     assert str(job_dir) in output
     assert "sbatch" in output
     assert "squeue" in output
+
+
+def test_init_config_can_be_checked_without_job_local_submit_script(tmp_path: Path) -> None:
+    job_dir, _input_dir, _mirror_log_dir, submit_script = _make_job(tmp_path)
+    submit_script.unlink()
+
+    init_result = _run(
+        [sys.executable, "-m", "autoslurm", "init", "--workdir", str(job_dir)],
+        env=_python_env(tmp_path),
+    )
+    _assert_success(init_result)
+
+    check_result = _run(
+        [sys.executable, "-m", "autoslurm", "check", "--workdir", str(job_dir)],
+        env=_python_env(tmp_path),
+    )
+
+    output = _assert_success(check_result)
+    assert str(REPO_ROOT / "submit.sh") in output
+
+
+def test_status_reads_legacy_launcher_state_schema(tmp_path: Path) -> None:
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "autoslurm-state.json").write_text(
+        (
+            "{\n"
+            '  "run_id": "run-123",\n'
+            '  "job_prefix": "chain",\n'
+            '  "status": "completed",\n'
+            '  "current_iteration": "2",\n'
+            '  "current_job_id": "1001",\n'
+            '  "last_final_state": "COMPLETED"\n'
+            "}\n"
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(
+        [sys.executable, "-m", "autoslurm", "status", "--workdir", str(job_dir), "--json"],
+        env=_python_env(tmp_path),
+    )
+
+    output = _assert_success(result)
+    status = json.loads(output)
+    assert status["workflow_id"] == "run-123"
+    assert status["name"] == "chain"
+    assert status["final_status"] == "completed"
+    assert status["current_iteration"] == 2
+    assert status["job_states"] == {"1001": "COMPLETED"}

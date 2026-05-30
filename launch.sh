@@ -923,12 +923,13 @@ done
 
 CURRENT_ITER=""
 WORKFLOW_STATUS="completed"
+FINAL_ITERATION="${LAST_COMPLETED_ITER:-$((iter - 1))}"
 record_event "workflow_complete" \
-    "final_iteration=${LAST_COMPLETED_ITER:-$((iter - 1))}" \
+    "final_iteration=$FINAL_ITERATION" \
     "max_iter=$MAX_ITER" \
     "converged=$WORKFLOW_CONVERGED"
 
 log_msg "=============================================================="
 log_msg "Chain automation completed successfully"
-log_msg "Final iteration: $((iter - 1)) / $MAX_ITER"
+log_msg "Final iteration: $FINAL_ITERATION / $MAX_ITER"
 log_msg "=============================================================="

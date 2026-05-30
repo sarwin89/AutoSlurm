@@ -114,6 +114,14 @@ def cmd_init(args: argparse.Namespace) -> int:
 def load_with_overrides(args: argparse.Namespace):
     workdir = Path(args.workdir).resolve()
     config = load_config(args.config, workdir)
+    repo_dir = Path(__file__).resolve().parents[1]
+    configured_paths = config.raw.get("paths") or {}
+    submit_script = args.submit_script
+    mirror_log_dir = args.mirror_log_dir
+    if submit_script is None and "submit_script" not in configured_paths:
+        submit_script = str(repo_dir / "submit.sh")
+    if mirror_log_dir is None and "mirror_log_dir" not in configured_paths:
+        mirror_log_dir = str(repo_dir / "logs")
     return workdir, apply_cli_overrides(
         config,
         code=args.code,
@@ -124,8 +132,8 @@ def load_with_overrides(args: argparse.Namespace):
         executable=args.executable or args.vasp_exe,
         nodes=args.nodes,
         log_dir=args.log_dir,
-        mirror_log_dir=args.mirror_log_dir,
-        submit_script=args.submit_script,
+        mirror_log_dir=mirror_log_dir,
+        submit_script=submit_script,
         monitor_interval=args.monitor_interval,
         success_string=args.success_string,
     )
